@@ -1,6 +1,7 @@
 """Offline tests for the web app. Run: python -m pytest -q  (or python -m unittest discover -s tests -v)."""
 import json
 import os
+from datetime import timedelta
 import sys
 import tempfile
 import unittest
@@ -69,9 +70,47 @@ class PageTests(AppTestCase):
     def test_home_renders_form(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"Enter Website Link", response.data)
-        self.assertIn(b'<form', response.data)
+        self.assertIn(b"Paste a link to read it", response.data)
+        self.assertIn(b'<form id="url-form"', response.data)
+        self.assertIn(b'action="/article"', response.data)  # works without JavaScript too
         self.assertIn(b'href="/library"', response.data)
+        self.assertIn(b'rel="manifest"', response.data)
+        self.assertNotIn(b"fonts.googleapis.com", response.data)
+
+    def test_home_lists_recent_reads_escaped(self):
+        self.save_snapshot(title="<img src=x onerror=alert(1)>Grid story", complete=False)
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("Recently read", body)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;Grid story", body)
+        self.assertIn("may be incomplete", body)
+        self.assertIn("just now", body)
+
+    def test_home_without_archive_still_renders(self):
+        with patch.object(web.archive_store, "get_store", side_effect=OSError("read-only")):
+            response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(b"Recently read", response.data)
+
+    def test_manifest_and_icons(self):
+        manifest = self.client.get("/manifest.webmanifest")
+        self.assertEqual(manifest.mimetype, "application/manifest+json")
+        icons = json.loads(manifest.data)["icons"]
+        for icon in icons:
+            with self.subTest(icon=icon["src"]):
+                response = self.client.get(icon["src"])
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.data[:8], b"\x89PNG\r\n\x1a\n")
+                response.close()
+        self.assertEqual(self.client.get("/static/icon-180.png").status_code, 200)
+
+    def test_age_filter(self):
+        now = web.datetime.now(web.timezone.utc)
+        cases = [(0, "just now"), (600, "10 min ago"), (3 * 3600, "3 h ago"), (2 * 86400, "2 d ago")]
+        for seconds, expected in cases:
+            stamp = (now - timedelta(seconds=seconds)).isoformat()
+            self.assertEqual(web.format_age(stamp), expected)
+        self.assertEqual(web.format_age("2020-01-02T03:04:05+00:00"), "2020-01-02")
+        self.assertEqual(web.format_age("garbage"), "garbage")
 
     def test_portuguese_home(self):
         with patch.dict(os.environ, {"LOCALE": "pt"}):
@@ -230,6 +269,64 @@ class PipelineTests(AppTestCase):
             self.assertEqual(web.configured_sources(URL), ["wayback", "googlebot"])
             with patch.object(web.headless, "enabled", return_value=True):
                 self.assertEqual(web.configured_sources(URL), ["wayback", "googlebot", "headless"])
+
+    def test_low_memory_refuses_to_fetch(self):
+        with patch.dict(os.environ, {"MIN_FREE_MB": "120"}), \
+                patch.object(web, "memory_available_mb", return_value=87), \
+                patch.object(web, "http_get") as get:
+            with self.assertRaises(web.UserFacingError) as error:
+                web.fetch_article(URL, self.strings)
+        get.assert_not_called()
+        self.assertIn("87 MB free, 120 MB", str(error.exception))
+
+    def test_memory_reading(self):
+        meminfo = Path(self.tmp.name) / "meminfo"
+        meminfo.write_text("MemTotal:  437500 kB\nMemFree: 1 kB\nMemAvailable:   281000 kB\n")
+        self.assertEqual(web.memory_available_mb(str(meminfo)), 274)
+        self.assertIsNone(web.memory_available_mb(str(meminfo) + ".missing"))
+
+    def test_enough_memory_fetches(self):
+        with patch.dict(os.environ, {"MIN_FREE_MB": "120"}), \
+                patch.object(web, "memory_available_mb", return_value=300), \
+                patch.object(web, "http_get", return_value=FakeResponse(FULL_ARTICLE)):
+            self.assertTrue(self.store.get(web.fetch_article(URL, self.strings))["complete"])
+
+    def test_archived_copy_does_not_wait_for_a_running_fetch(self):
+        existing = self.save_snapshot()
+        acquired = web.FETCH_SLOTS.acquire(blocking=False)
+        try:
+            # Even with every slot taken, an archived article opens straight away.
+            for _ in range(5):
+                web.FETCH_SLOTS.acquire(blocking=False)
+            self.assertEqual(web.fetch_article(URL, self.strings), existing)
+        finally:
+            while True:
+                try:
+                    web.FETCH_SLOTS.release()
+                except ValueError:
+                    break
+        self.assertTrue(acquired)
+
+    def test_waiting_for_a_slot_is_reported(self):
+        class BusySlots:  # the first (non-blocking) try fails, the blocking one succeeds
+            def acquire(self, blocking=True):
+                return blocking
+            def release(self):
+                pass
+        steps = []
+        with patch.object(web, "FETCH_SLOTS", BusySlots()), \
+                patch.object(web, "set_step", lambda job, step: steps.append(step)), \
+                patch.object(web, "http_get", return_value=FakeResponse(FULL_ARTICLE)):
+            web.fetch_article(URL, self.strings, job_id="j")
+        self.assertEqual(steps[:2], ["queued", "connect"])
+
+    def test_free_slot_skips_queued(self):
+        steps = []
+        with patch.object(web, "set_step", lambda job, step: steps.append(step)), \
+                patch.object(web, "http_get", return_value=FakeResponse(FULL_ARTICLE)):
+            web.fetch_article(URL, self.strings, job_id="j")
+        self.assertNotIn("queued", steps)
+        self.assertEqual(steps[0], "connect")
 
     def test_raw_html_storage_can_be_disabled(self):
         with patch.dict(os.environ, {"STORE_RAW_HTML": "0"}), \

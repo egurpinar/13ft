@@ -44,6 +44,210 @@ a { color: var(--accent); }
 .button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--line); }
 """
 
+HOME_TEMPLATE = """<!DOCTYPE html>
+<html lang="{{ lang }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>13ft</title>
+<link rel="icon" href="/favicon.ico" type="image/png">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/static/icon-180.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="13ft">
+<meta name="theme-color" content="#fbfaf7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#17161a" media="(prefers-color-scheme: dark)">
+<style>
+""" + BASE_CSS + """
+[hidden] { display: none !important; }
+.home { padding-top: 12vh; }
+h1 { font-size: 1.6rem; line-height: 1.25; margin: 0 0 18px; }
+form.go { display: flex; gap: 8px; }
+form.go input { flex: 1; min-width: 0; font: inherit; font-size: 1.05rem; padding: 12px 14px;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--text); }
+form.go input:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+form.go .button { padding: 12px 20px; border-radius: 10px; font-size: 1.05rem; }
+.button.wide { width: 100%; margin-top: 10px; padding: 12px; border-radius: 10px; }
+.hint { font-size: 0.9rem; margin: 12px 0 0; }
+.status-url { font-size: 0.85rem; color: var(--muted); overflow-wrap: anywhere; margin: 0 0 14px; }
+.status-line { display: flex; align-items: center; gap: 12px; font-size: 1.05rem; font-weight: 600; min-height: 1.6em; }
+.spinner { width: 18px; height: 18px; flex: none; border-radius: 50%; border: 2px solid var(--line);
+  border-top-color: var(--accent); animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
+.track { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin: 14px 0 8px; }
+.fill { height: 100%; width: 0; background: var(--accent); transition: width 0.4s ease; }
+.small { font-size: 0.85rem; margin: 0; }
+.error { margin-top: 16px; }
+.error p { margin: 0 0 12px; }
+.recent { margin-top: 48px; }
+.recent h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 4px; }
+ul.items { list-style: none; margin: 0 0 12px; padding: 0; }
+ul.items li { padding: 12px 0; border-bottom: 1px solid var(--line); }
+ul.items .title { font-weight: 600; text-decoration: none; color: var(--text); overflow-wrap: anywhere; }
+ul.items .sub { font-size: 0.85rem; color: var(--muted); margin-top: 2px; overflow-wrap: anywhere; }
+.badge { font-size: 0.75rem; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--warn-line);
+  background: var(--warn-bg); color: var(--warn-text); }
+</style>
+</head>
+<body>
+<nav class="bar">
+  <a class="brand" href="/">13ft</a>
+  <a href="/library">{{ library_link }}</a>
+</nav>
+<main class="wrap home">
+  <section id="form-view">
+    <h1>{{ heading }}</h1>
+    <form id="url-form" class="go" method="post" action="/article">
+      <input id="link" name="link" type="text" inputmode="url" autocomplete="off" autocapitalize="off"
+             autocorrect="off" spellcheck="false" placeholder="https://" aria-label="{{ heading }}" required>
+      <button class="button" type="submit">{{ submit }}</button>
+    </form>
+    <button id="paste-btn" class="button secondary wide" type="button" hidden>{{ paste_button }}</button>
+    <p class="muted hint">{{ label }}</p>
+  </section>
+
+  <section id="status-view" hidden aria-live="polite">
+    <p class="status-url" id="status-url"></p>
+    <div class="status-line"><span class="spinner" id="spinner" aria-hidden="true"></span><span id="status-step"></span></div>
+    <div class="track"><div class="fill" id="progress-fill"></div></div>
+    <p class="muted small" id="elapsed-time"></p>
+    <div class="error" id="error-area" hidden>
+      <div class="notice" id="error-text"></div>
+      <button class="button" type="button" id="retry-btn">{{ retry_button }}</button>
+    </div>
+  </section>
+
+  {% if recent %}
+  <section class="recent" id="recent">
+    <h2>{{ recent_heading }}</h2>
+    <ul class="items">
+      {% for it in recent %}
+      <li><a class="title" href="/read/{{ it.id }}">{{ it.title or it.url }}</a>
+        <div class="sub">{{ it.site_name or it.url_key }} · {{ it.fetched_at | ago }}{% if not it.complete %} · <span class="badge">may be incomplete</span>{% endif %}</div></li>
+      {% endfor %}
+    </ul>
+    <a href="/library">{{ library_all }} →</a>
+  </section>
+  {% endif %}
+</main>
+<script>
+(function () {
+  const UI = {{ ui_strings | tojson }};
+  const STEPS = {{ steps | tojson }};
+  const AUTOSTART = {{ autostart | tojson }};
+  const $ = (id) => document.getElementById(id);
+  const input = $('link'), formView = $('form-view'), statusView = $('status-view'), recent = $('recent');
+  let timer = null;
+
+  // Text shared from apps is often "Headline https://..." - take the link out of it.
+  function extractLink(text) {
+    const found = (text || '').match(/https?:\\/\\/\\S+/i);
+    if (found) return found[0];
+    const t = (text || '').trim();
+    return /^[\\w-]+(\\.[\\w-]+)+(:\\d+)?([\\/?#]\\S*)?$/.test(t) ? t : '';
+  }
+
+  function setStep(id) {
+    const i = STEPS.findIndex((s) => s.id === id);
+    if (i < 0) return;
+    $('status-step').textContent = STEPS[i].label;
+    $('progress-fill').style.width = Math.min(((i + 1) / STEPS.length) * 100, 95) + '%';
+  }
+
+  function stop() { if (timer) clearInterval(timer); timer = null; }
+
+  function showError(message) {
+    stop();
+    $('spinner').hidden = true;
+    $('status-step').textContent = UI.error_title;
+    $('error-text').textContent = message;
+    $('error-area').hidden = false;
+  }
+
+  function reset() {
+    stop();
+    statusView.hidden = true;
+    formView.hidden = false;
+    if (recent) recent.hidden = false;
+    input.value = '';
+    input.focus();
+  }
+
+  function start(link, refresh) {
+    formView.hidden = true;
+    if (recent) recent.hidden = true;
+    statusView.hidden = false;
+    $('error-area').hidden = true;
+    $('spinner').hidden = false;
+    $('status-url').textContent = link;
+    $('progress-fill').style.width = '0%';
+    setStep('connect');
+    const started = Date.now();
+    timer = setInterval(() => {
+      $('elapsed-time').textContent = UI.elapsed_template.replace('{seconds}', Math.round((Date.now() - started) / 1000));
+    }, 500);
+    const events = new EventSource('/status?url=' + encodeURIComponent(link) + (refresh ? '&refresh=1' : ''));
+    events.addEventListener('step', (e) => {
+      const data = JSON.parse(e.data);
+      setStep(data.step);
+      if (data.redirect) {
+        events.close();
+        stop();
+        $('progress-fill').style.width = '100%';
+        window.location.href = data.redirect;
+      }
+    });
+    events.addEventListener('error_msg', (e) => { events.close(); showError(JSON.parse(e.data).message); });
+    events.onerror = () => { events.close(); showError(UI.connection_lost_error); };
+  }
+
+  // Pasting a link is enough: no need to press the button.
+  input.addEventListener('paste', () => setTimeout(() => {
+    const link = extractLink(input.value);
+    if (link) { input.value = link; start(link, false); }
+  }, 0));
+
+  $('url-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const link = extractLink(input.value) || input.value.trim();
+    if (link) start(link, false);
+  });
+
+  $('retry-btn').addEventListener('click', reset);
+
+  // Reading the clipboard needs a secure context (https or localhost); over
+  // plain http on the home network, paste into the box instead.
+  const pasteButton = $('paste-btn');
+  if (window.isSecureContext && navigator.clipboard && navigator.clipboard.readText) {
+    pasteButton.hidden = false;
+    pasteButton.addEventListener('click', async () => {
+      try {
+        const link = extractLink(await navigator.clipboard.readText());
+        if (link) { input.value = link; start(link, false); return; }
+      } catch (err) { /* permission denied: fall back to the box */ }
+      input.focus();
+    });
+  }
+
+  // Coming back with the Back button: show a fresh page (and an updated list).
+  window.addEventListener('pageshow', (e) => { if (e.persisted) window.location.reload(); });
+
+  if (AUTOSTART && AUTOSTART.url) {
+    input.value = AUTOSTART.url;
+    start(AUTOSTART.url, AUTOSTART.refresh);
+  } else if (window.matchMedia('(pointer: fine)').matches) {
+    input.focus();  // desktop: ready to paste; phones: don't pop the keyboard up
+  }
+})();
+</script>
+</body>
+</html>
+"""
+
+
 READER_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
