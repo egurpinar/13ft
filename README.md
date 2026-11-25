@@ -75,7 +75,7 @@ sudo bash 13ft-reader-archive/deploy/raspberry-pi/install.sh
 Then open `http://<the Pi's IP>:5000` on any device on your network. Run the same two lines again to update; `--uninstall` removes it (the library is kept). The installer:
 - installs prebuilt packages for ARMv6/ARMv7 from piwheels, so nothing is compiled;
 - runs 13ft as a systemd service under its own account, read-only except for `/var/lib/13ft`;
-- runs it at the lowest CPU and disk priority, with at most 60 % of one core and a 160 MB memory cap (when the kernel's memory controller is enabled), as the first process the kernel stops if memory runs out, and as a single process (about 25 MB less than gunicorn);
+- runs it at the lowest CPU priority (nice 19) and the lowest normal disk priority (best-effort level 7), with at most 60 % of one core and a 160 MB memory cap (when the kernel's memory controller is enabled), as the first process the kernel stops if memory runs out, and as a single process (about 25 MB less than gunicorn);
 - fetches one article at a time, and refuses to fetch while less than `MIN_FREE_MB` (100) of memory is free;
 - refuses to install with under 150 MB of memory free, or while the other Pi-hole named in `/etc/nhrc-pi.conf` (`PEER_IP`) isn't answering DNS.
 

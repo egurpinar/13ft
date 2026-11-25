@@ -5,7 +5,7 @@
 #   sudo bash deploy/raspberry-pi/install.sh              install, or update to this copy
 #   sudo bash deploy/raspberry-pi/install.sh --uninstall  remove it (your library is kept)
 #
-# Made to share a Pi with Pi-hole. 13ft runs at the lowest CPU and disk
+# Made to share a Pi with Pi-hole. 13ft runs at the lowest CPU and normal disk
 # priority, may use at most 60 % of one core and 160 MB of memory, fetches one
 # article at a time, and refuses to fetch while memory is short. Nothing is
 # installed while the other Pi-hole (PEER_IP in /etc/nhrc-pi.conf, when that

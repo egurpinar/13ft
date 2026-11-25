@@ -17,7 +17,7 @@ ExecStart=/opt/13ft/venv/bin/python /opt/13ft/app/portable.py
 Restart=on-failure
 RestartSec=15
 
-# Pi-hole (DNS) and the camera come first. 13ft gets the lowest CPU and disk
+# Pi-hole (DNS) and the camera come first. 13ft gets the lowest CPU and normal disk
 # priority, at most 60 % of one CPU core, and a memory cap; if memory runs
 # out anyway, the kernel stops 13ft before anything else.
 Nice=19
