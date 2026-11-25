@@ -65,6 +65,22 @@ Or with Docker (builds this checkout; the port is published on 127.0.0.1 only an
 docker compose up -d --build
 ```
 
+On a Raspberry Pi, including a Pi Zero W that also runs Pi-hole, without Docker:
+
+```sh
+curl -fsSL https://github.com/egurpinar/13ft/archive/refs/heads/reader-archive.tar.gz | tar xz
+sudo bash 13ft-reader-archive/deploy/raspberry-pi/install.sh
+```
+
+Then open `http://<the Pi's IP>:5000` on any device on your network. Run the same two lines again to update; `--uninstall` removes it (the library is kept). The installer:
+- installs prebuilt packages for ARMv6/ARMv7 from piwheels, so nothing is compiled;
+- runs 13ft as a systemd service under its own account, read-only except for `/var/lib/13ft`;
+- runs it at the lowest CPU and disk priority, with at most 60 % of one core and a 160 MB memory cap (when the kernel's memory controller is enabled), as the first process the kernel stops if memory runs out, and as a single process (about 25 MB less than gunicorn);
+- fetches one article at a time, and refuses to fetch while less than `MIN_FREE_MB` (100) of memory is free;
+- refuses to install with under 150 MB of memory free, or while the other Pi-hole named in `/etc/nhrc-pi.conf` (`PEER_IP`) isn't answering DNS.
+
+Settings are in `/etc/13ft.env`. To use a name instead of the IP, add a Local DNS Record in Pi-hole (e.g. `read.lan`) pointing at the Pi; `read.lan` is already in the default `ALLOWED_HOSTS`.
+
 Optional headless source (not in the Alpine image, because Playwright needs glibc):
 
 ```sh
@@ -75,7 +91,8 @@ HEADLESS=on python app/portable.py
 
 ### Ways to open an article
 
-- Paste the link on the home page.
+- Paste the link into the box on the home page. Pasting is enough, there's no need to press Read. Text with a link in it, such as "Look at this https://…", works too.
+- **Phone home screen.** Open the home page and choose *Add to Home Screen* (Safari's share menu, or Chrome's ⋮ menu). It gets the 13ft icon and opens like an app.
 - Put the server address in front of any link: `http://127.0.0.1:5000/https://example.com/story`.
 - **Bookmarklet.** Create a bookmark with this URL, then click it on any article:
   `javascript:location.href='http://127.0.0.1:5000/'+location.href`
@@ -94,6 +111,8 @@ HEADLESS=on python app/portable.py
 | `DATA_DIR` | `./data` (`/data` in Docker) | Where `archive.sqlite3` is kept. |
 | `SOURCES` | `googlebot,clean,wayback,archive_today,headless` | Which sources to try, in order. |
 | `MIN_WORDS` | `150` | Below this, a copy counts as "short" and the next source is tried. |
+| `FETCH_CONCURRENCY` | `2` (`1` on the Pi) | Articles fetched at the same time; more requests wait their turn. |
+| `MIN_FREE_MB` | `0` = off (`100` on the Pi) | Don't start a fetch while the system has less memory available than this (Linux only). |
 | `HEADLESS` | `off` | `on` enables the headless-browser source (needs Playwright). |
 | `CHROMIUM_PATH` | *(Playwright's)* | Use a specific Chromium binary for the headless source. |
 | `BLOCK_SCRIPT_HOSTS` | *(empty)* | Extra script hosts to block in the headless source, comma-separated. |
