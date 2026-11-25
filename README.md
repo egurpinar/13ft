@@ -24,7 +24,7 @@ The server now displays a loading/status page while it fetches the target articl
 This branch turns 13ft into a self-hosted replacement for archive.ph for one person.
 
 - **Reader view.** The article is extracted with [Trafilatura](https://github.com/adbar/trafilatura), or taken from the page's JSON-LD `articleBody` when that is fuller, and shown on a clean page with no publisher scripts. This removes script-driven overlays and recovers text that a paywall only hides with CSS.
-- **It checks whether the copy is complete.** It checks for a "subscribe to continue" prompt after a short text, and compares against the publisher's own `wordCount`. If a source gives only a teaser, the next source is tried. If none gives a full copy, the longest one is kept and the reader page says why it may be incomplete.
+- **It checks whether the copy is complete.** It checks for a "subscribe to continue" prompt after a short text, and compares against the publisher's own `wordCount`. If the page has only a teaser, the web archives are asked next. If no source gives a full copy, the longest one is kept and the reader page says why it may be incomplete.
 - **Personal archive.** Every article is saved to a local SQLite file, with full-text search, all saved copies of each article, and the saved page in its original layout. Opening a link you've read before is instant, and the copy survives if the publisher edits or removes the page.
 - **Safer to run.**
   - It listens on `127.0.0.1` by default.
@@ -34,16 +34,20 @@ This branch turns 13ft into a self-hosted replacement for archive.ph for one per
   - The saved original layout is served in a CSP sandbox, so a publisher's scripts can never read your library.
 - **Tracking parameters removed.** `utm_*`, newsletter IDs (`st_*`, `mc_*`) and similar are stripped before the publisher is contacted.
 
-### Sources, in the order they are tried
+### Sources, and how it stays fast
 
-| Name (`SOURCES`) | What it does |
-| --- | --- |
-| `freedium` | Medium articles only, through Freedium (upstream behaviour). |
-| `googlebot` | Requests the page with Google's crawler user agent (13ft's original method). |
-| `clean` | An ordinary browser request with no cookies and a search-engine referrer. This resets "N free articles" meters kept in cookies. |
-| `wayback` | The latest Internet Archive snapshot (raw `id_` copy). |
-| `archive_today` | The latest archive.today snapshot, if one exists and no CAPTCHA is shown. |
-| `headless` | Optional. Renders the page in headless Chromium with known paywall-vendor scripts (Piano/Tinypass, Poool, Pelcro, …) blocked. Off unless `HEADLESS=on`. |
+Sources run in rounds. The sources in a round run **at the same time**, and the first complete article ends the search, so you never wait for a slower source. The next round only starts if no source in the current one had the full text.
+
+| Round | Name (`SOURCES`) | What it does |
+| --- | --- | --- |
+| 1 | `googlebot` | Requests the page with Google's crawler user agent (13ft's original method). |
+| 1 | `clean` | An ordinary browser request with no cookies and a search-engine referrer. This resets "N free articles" meters kept in cookies. |
+| 1 | `freedium` | Medium articles only, through Freedium (upstream behaviour). |
+| 2 | `wayback` | The latest Internet Archive snapshot (raw `id_` copy). |
+| 2 | `archive_today` | The latest archive.today snapshot, if one exists and no CAPTCHA is shown. |
+| 3 | `headless` | Optional. Renders the page in headless Chromium with known paywall-vendor scripts (Piano/Tinypass, Poool, Pelcro, …) blocked. Off unless `HEADLESS=on`. |
+
+Each request gets 5 s to connect and at most 20 s between bytes, and each round at most 25 s; whatever has arrived by then is used. An article that's already in your library opens instantly.
 
 What to expect, honestly:
 - **Metered paywalls and overlay paywalls** (the text is in the page, then hidden) usually work.
@@ -53,6 +57,16 @@ What to expect, honestly:
 The "How this copy was obtained" section at the bottom of each reader page lists what each source returned.
 
 ### Run it
+
+**On a Mac** (one command in Terminal; needs Python 3.9 or newer, which macOS offers to install if it's missing):
+
+```sh
+cd "$(mktemp -d)" && curl -fsSL https://github.com/egurpinar/13ft/archive/refs/heads/reader-archive.tar.gz | tar xz && bash 13ft-reader-archive/deploy/macos/install.sh
+```
+
+It installs into `~/Library/Application Support/13ft`, starts when you log in (a LaunchAgent), restarts itself if it ever crashes, and opens **http://localhost:8013** (port 8013 because macOS's AirPlay Receiver uses 5000). Only your Mac can reach it. When idle it uses no CPU and about 50 MB of memory. Run the same command again to update; `bash ~/Library/Application\ Support/13ft/install.sh --uninstall` removes it and keeps your library.
+
+**Anywhere else** (Linux, Windows):
 
 ```sh
 python -m pip install -r requirements.txt
@@ -65,22 +79,6 @@ Or with Docker (builds this checkout; the port is published on 127.0.0.1 only an
 docker compose up -d --build
 ```
 
-On a Raspberry Pi, including a Pi Zero W that also runs Pi-hole, without Docker:
-
-```sh
-curl -fsSL https://github.com/egurpinar/13ft/archive/refs/heads/reader-archive.tar.gz | tar xz
-sudo bash 13ft-reader-archive/deploy/raspberry-pi/install.sh
-```
-
-Then open `http://<the Pi's IP>:5000` on any device on your network. Run the same two lines again to update; `--uninstall` removes it (the library is kept). The installer:
-- installs prebuilt packages for ARMv6/ARMv7 from piwheels, so nothing is compiled;
-- runs 13ft as a systemd service under its own account, read-only except for `/var/lib/13ft`;
-- runs it at the lowest CPU priority (nice 19) and the lowest normal disk priority (best-effort level 7), with at most 60 % of one core and a 160 MB memory cap (when the kernel's memory controller is enabled), as the first process the kernel stops if memory runs out, and as a single process (about 25 MB less than gunicorn);
-- fetches one article at a time, and refuses to fetch while less than `MIN_FREE_MB` (100) of memory is free;
-- refuses to install with under 150 MB of memory free, or while the other Pi-hole named in `/etc/nhrc-pi.conf` (`PEER_IP`) isn't answering DNS.
-
-Settings are in `/etc/13ft.env`. To use a name instead of the IP, add a Local DNS Record in Pi-hole (e.g. `read.lan`) pointing at the Pi; `read.lan` is already in the default `ALLOWED_HOSTS`.
-
 Optional headless source (not in the Alpine image, because Playwright needs glibc):
 
 ```sh
@@ -92,27 +90,28 @@ HEADLESS=on python app/portable.py
 ### Ways to open an article
 
 - Paste the link into the box on the home page. Pasting is enough, there's no need to press Read. Text with a link in it, such as "Look at this https://…", works too.
-- **Phone home screen.** Open the home page and choose *Add to Home Screen* (Safari's share menu, or Chrome's ⋮ menu). It gets the 13ft icon and opens like an app.
-- Put the server address in front of any link: `http://127.0.0.1:5000/https://example.com/story`.
+- **As an app in the Dock.** In Safari: File → Add to Dock. In Chrome: ⋮ → Cast, save, and share → Install page as app. It gets the 13ft icon and opens in its own window.
+- Put the server address in front of any link: `http://localhost:8013/https://example.com/story`.
 - **Bookmarklet.** Create a bookmark with this URL, then click it on any article:
-  `javascript:location.href='http://127.0.0.1:5000/'+location.href`
+  `javascript:location.href='http://localhost:8013/'+location.href`
 - **Address-bar keyword.** Add a site search in Chrome/Edge (Settings → Search engine → Manage → Site search) or a keyword bookmark in Firefox:
-  - URL: `http://127.0.0.1:5000/?url=%s`
+  - URL: `http://localhost:8013/?url=%s`
   - Shortcut: `rt`
-  
+
   Then type `rt <link>` in the address bar.
+
+These addresses use the Mac installer's port, 8013. If you started it by hand, use `http://127.0.0.1:5000` instead.
 
 ### Configuration (environment variables)
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `HOST` / `PORT` | `127.0.0.1` / `5000` | Listen address. Use `0.0.0.0` to serve other devices, and then set `ALLOWED_HOSTS`. |
-| `ALLOWED_HOSTS` | *(empty)* | Extra host names the server answers to, e.g. `raspberrypi.local`. `localhost` and IP addresses always work. |
+| `HOST` / `PORT` | `127.0.0.1` / `5000` (Mac installer: `8013`) | Listen address. Use `0.0.0.0` to serve other devices, and then set `ALLOWED_HOSTS`. |
+| `ALLOWED_HOSTS` | *(empty)* | Extra host names the server answers to, e.g. `reader.local`. `localhost` and IP addresses always work. |
 | `DATA_DIR` | `./data` (`/data` in Docker) | Where `archive.sqlite3` is kept. |
-| `SOURCES` | `googlebot,clean,wayback,archive_today,headless` | Which sources to try, in order. |
+| `SOURCES` | `googlebot,clean,wayback,archive_today,headless` | Which sources to use; each one runs in its round (see the table above). |
 | `MIN_WORDS` | `150` | Below this, a copy counts as "short" and the next source is tried. |
-| `FETCH_CONCURRENCY` | `2` (`1` on the Pi) | Articles fetched at the same time; more requests wait their turn. |
-| `MIN_FREE_MB` | `0` = off (`100` on the Pi) | Don't start a fetch while the system has less memory available than this (Linux only). |
+| `FETCH_CONCURRENCY` | `2` | Articles fetched at the same time; more requests wait their turn. |
 | `HEADLESS` | `off` | `on` enables the headless-browser source (needs Playwright). |
 | `CHROMIUM_PATH` | *(Playwright's)* | Use a specific Chromium binary for the headless source. |
 | `BLOCK_SCRIPT_HOSTS` | *(empty)* | Extra script hosts to block in the headless source, comma-separated. |

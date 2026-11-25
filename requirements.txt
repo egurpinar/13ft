@@ -3,3 +3,6 @@ flask
 gunicorn
 requests
 trafilatura>=2.0,<3
+# Python 3.9 (the one macOS ships) gets trafilatura 2.0, whose jusText
+# dependency needs the module lxml moved into this separate package.
+lxml_html_clean; python_version < "3.10"

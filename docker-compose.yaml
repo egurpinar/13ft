@@ -12,7 +12,7 @@ services:
       - "127.0.0.1:5000:5000"
     environment:
       - LOCALE=en
-      # - ALLOWED_HOSTS=raspberrypi.local
+      # - ALLOWED_HOSTS=reader.local
       # - SOURCES=googlebot,clean,wayback,archive_today
     volumes:
       - 13ft-data:/data

@@ -1,6 +1,7 @@
 """Offline tests for the web app. Run: python -m pytest -q  (or python -m unittest discover -s tests -v)."""
 import json
 import os
+import time
 from datetime import timedelta
 import sys
 import tempfile
@@ -53,11 +54,12 @@ class AppTestCase(unittest.TestCase):
         return self.store.save(**record)
 
     def run_sources(self, responses):
-        """Patch the source functions with canned (html, url) results or exceptions."""
+        """Patch the source functions with canned (html, url) results, exceptions or fake functions."""
         patches = []
         for name, result in responses.items():
             function_name = web.SOURCES[name][0]
-            kwargs = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
+            dynamic = isinstance(result, Exception) or callable(result)
+            kwargs = {"side_effect": result} if dynamic else {"return_value": result}
             p = patch.object(web, function_name, **kwargs)
             patches.append(p)
         mocks = {name: p.start() for name, p in zip(responses, patches)}
@@ -146,13 +148,25 @@ class PageTests(AppTestCase):
         self.assertEqual(soup.base["href"], "https://example.com/news/")
 
 
+def later(result, seconds):
+    """A fake source that answers after *seconds* (or raises, if *result* is an exception)."""
+    def source(url, job_id=None):
+        time.sleep(seconds)
+        if isinstance(result, Exception):
+            raise result
+        return result
+    return source
+
+
 class PipelineTests(AppTestCase):
-    def test_direct_fetch_adds_scheme_and_googlebot(self):
+    def test_direct_fetch_adds_scheme_and_asks_publisher_both_ways(self):
         with patch.object(web, "http_get", return_value=FakeResponse(FULL_ARTICLE)) as get:
             snapshot_id = web.fetch_article("example.com/news/article", self.strings)
-        get.assert_called_once_with(URL, headers=web.googlebot_headers, timeout=30)
+        # Round 1 sends the Googlebot request and the fresh browser request together.
+        get.assert_any_call(URL, headers=web.googlebot_headers, timeout=web.REQUEST_TIMEOUT)
+        self.assertTrue(any("Referer" in c.kwargs["headers"] for c in get.call_args_list))
         snapshot = self.store.get(snapshot_id)
-        self.assertEqual(snapshot["method"], "googlebot")
+        self.assertIn(snapshot["method"], ("googlebot", "clean"))
         self.assertTrue(snapshot["complete"])
         self.assertIn("Paragraph 9", snapshot["content_text"])
 
@@ -162,16 +176,18 @@ class PipelineTests(AppTestCase):
             web.fetch_article(link, self.strings)
         self.assertEqual(get.call_args.args[0], URL + "?sid=abc&ss=P")
 
-    def test_teaser_falls_through_to_next_source(self):
+    def test_teaser_from_one_request_full_text_from_the_other(self):
         mocks = self.run_sources({
             "googlebot": (TEASER, URL),
-            "clean": (FULL_ARTICLE, URL),
+            "clean": later((FULL_ARTICLE, URL), 0.1),  # arrives second, so both are examined
             "wayback": AssertionError("should not be reached"),
+            "archive_today": AssertionError("should not be reached"),
         })
         snapshot = self.store.get(web.fetch_article(URL, self.strings))
         self.assertEqual(snapshot["method"], "clean")
         self.assertEqual([a["outcome"] for a in snapshot["attempts"]], ["partial", "complete"])
         mocks["wayback"].assert_not_called()
+        mocks["archive_today"].assert_not_called()
 
     def test_best_partial_copy_is_kept_with_warnings(self):
         longer_teaser = page(paragraphs(3), extra_body="<p>Subscribe now to continue reading.</p>")
@@ -191,10 +207,9 @@ class PipelineTests(AppTestCase):
         archived = "https://web.archive.org/web/20260101000000id_/" + URL
         with patch.object(web, "http_get", return_value=FakeResponse("Blocked", status_code=403)), \
                 patch.object(web, "fetch_via_archive_org", return_value=(FULL_ARTICLE, archived)) as archive, \
-                patch.object(web, "fetch_via_archive_ph") as fallback:
+                patch.object(web, "fetch_via_archive_ph", return_value=(None, None)):
             snapshot = self.store.get(web.fetch_article(URL, self.strings))
         archive.assert_called_once_with(URL, None)
-        fallback.assert_not_called()
         self.assertEqual(snapshot["method"], "wayback")
         self.assertEqual(snapshot["source_url"], archived)
         self.assertEqual([a["detail"] for a in snapshot["attempts"][:2]], ["HTTP 403", "HTTP 403"])
@@ -209,7 +224,7 @@ class PipelineTests(AppTestCase):
 
     def test_challenge_pages_are_skipped(self):
         challenge = "<html><title>Just a moment...</title><body>Checking your browser</body></html>"
-        self.run_sources({"googlebot": (challenge, URL), "clean": (FULL_ARTICLE, URL)})
+        self.run_sources({"googlebot": (challenge, URL), "clean": later((FULL_ARTICLE, URL), 0.1)})
         snapshot = self.store.get(web.fetch_article(URL, self.strings))
         self.assertEqual(snapshot["attempts"][0]["outcome"], "challenge")
         self.assertEqual(snapshot["method"], "clean")
@@ -257,39 +272,56 @@ class PipelineTests(AppTestCase):
         self.assertNotEqual(refreshed, existing)
         self.assertEqual(len(self.store.versions(web.urltools.archive_key(URL))), 2)
 
-    def test_medium_uses_freedium_before_direct_fetch(self):
-        with patch.object(web, "fetch_via_freedium", return_value=(FULL_ARTICLE, "https://freedium.cfd/x")), \
-                patch.object(web, "http_get") as get:
+    def test_medium_also_asks_freedium(self):
+        with patch.object(web, "fetch_via_freedium", return_value=(FULL_ARTICLE, "https://freedium.cfd/x")) as freedium, \
+                patch.object(web, "http_get", return_value=FakeResponse("Blocked", status_code=403)):
             snapshot = self.store.get(web.fetch_article("https://medium.com/story", self.strings))
-        get.assert_not_called()
+        freedium.assert_called_once_with("https://medium.com/story", None)
         self.assertEqual(snapshot["method"], "freedium")
+
+    def test_no_waiting_for_a_slow_source_once_the_article_is_complete(self):
+        self.run_sources({"googlebot": (FULL_ARTICLE, URL), "clean": later((FULL_ARTICLE, URL), 3)})
+        started = time.monotonic()
+        snapshot = self.store.get(web.fetch_article(URL, self.strings))
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(snapshot["method"], "googlebot")
+        self.assertEqual(snapshot["attempts"][1]["outcome"], "skipped")
+
+    def test_archives_are_asked_together_and_only_when_needed(self):
+        self.run_sources({
+            "googlebot": (TEASER, URL), "clean": (TEASER, URL),
+            "wayback": later((FULL_ARTICLE, "https://web.archive.org/x"), 1.0),
+            "archive_today": later((FULL_ARTICLE, "https://archive.ph/x"), 1.0),
+        })
+        steps = []
+        started = time.monotonic()
+        with patch.object(web, "set_step", lambda job, step: steps.append(step)):
+            snapshot = self.store.get(web.fetch_article(URL, self.strings, job_id="j"))
+        self.assertLess(time.monotonic() - started, 1.8)  # one at a time would take 2 s or more
+        self.assertIn(snapshot["method"], ("wayback", "archive_today"))
+        self.assertEqual(steps, ["connect", "fetch", "archives", "process", "cleanup"])
+
+    def test_round_deadline_uses_what_has_arrived(self):
+        self.run_sources({
+            "googlebot": later((FULL_ARTICLE, URL), 3),
+            "clean": (TEASER, URL),
+            "wayback": (FULL_ARTICLE, "https://web.archive.org/x"),
+            "archive_today": later((None, None), 3),
+        })
+        started = time.monotonic()
+        with patch.object(web, "ROUND_DEADLINE", 0.5):
+            snapshot = self.store.get(web.fetch_article(URL, self.strings))
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(snapshot["method"], "wayback")
+        outcomes = {a["source"]: a["outcome"] for a in snapshot["attempts"]}
+        self.assertEqual(outcomes["googlebot"], "timeout")
+        self.assertEqual(outcomes["clean"], "partial")
 
     def test_sources_env_controls_order_and_headless_needs_opt_in(self):
         with patch.dict(os.environ, {"SOURCES": "wayback, googlebot, nonsense, headless"}):
             self.assertEqual(web.configured_sources(URL), ["wayback", "googlebot"])
             with patch.object(web.headless, "enabled", return_value=True):
                 self.assertEqual(web.configured_sources(URL), ["wayback", "googlebot", "headless"])
-
-    def test_low_memory_refuses_to_fetch(self):
-        with patch.dict(os.environ, {"MIN_FREE_MB": "120"}), \
-                patch.object(web, "memory_available_mb", return_value=87), \
-                patch.object(web, "http_get") as get:
-            with self.assertRaises(web.UserFacingError) as error:
-                web.fetch_article(URL, self.strings)
-        get.assert_not_called()
-        self.assertIn("87 MB free, 120 MB", str(error.exception))
-
-    def test_memory_reading(self):
-        meminfo = Path(self.tmp.name) / "meminfo"
-        meminfo.write_text("MemTotal:  437500 kB\nMemFree: 1 kB\nMemAvailable:   281000 kB\n")
-        self.assertEqual(web.memory_available_mb(str(meminfo)), 274)
-        self.assertIsNone(web.memory_available_mb(str(meminfo) + ".missing"))
-
-    def test_enough_memory_fetches(self):
-        with patch.dict(os.environ, {"MIN_FREE_MB": "120"}), \
-                patch.object(web, "memory_available_mb", return_value=300), \
-                patch.object(web, "http_get", return_value=FakeResponse(FULL_ARTICLE)):
-            self.assertTrue(self.store.get(web.fetch_article(URL, self.strings))["complete"])
 
     def test_archived_copy_does_not_wait_for_a_running_fetch(self):
         existing = self.save_snapshot()
@@ -318,7 +350,7 @@ class PipelineTests(AppTestCase):
                 patch.object(web, "set_step", lambda job, step: steps.append(step)), \
                 patch.object(web, "http_get", return_value=FakeResponse(FULL_ARTICLE)):
             web.fetch_article(URL, self.strings, job_id="j")
-        self.assertEqual(steps[:2], ["queued", "connect"])
+        self.assertEqual(steps[:3], ["queued", "connect", "fetch"])
 
     def test_free_slot_skips_queued(self):
         steps = []

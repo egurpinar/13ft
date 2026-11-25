@@ -8,6 +8,8 @@ import uuid
 import threading
 import time
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime, timezone
 from functools import lru_cache
 from urllib.parse import urljoin, urlparse, urlsplit, quote, unquote
@@ -47,11 +49,7 @@ _DEFAULT_STRINGS = {
     "recent_heading": "Recently read",
     "library_all": "All saved articles",
     "step_queued": "Waiting for the previous article to finish...",
-    "low_memory_error": (
-        "This server is short on memory right now ({available} MB free, {needed} MB "
-        "wanted), so nothing was fetched. Something else may be busy (on a Pi-hole, "
-        "a camera live view); try again in a few minutes."
-    ),
+    "step_archives": "The page had only part of the article: checking web archives...",
     "blocked_target_error": (
         "Refusing to fetch this address: it is not an http(s) URL, or it points "
         "to a private or local network. Set ALLOW_PRIVATE_TARGETS=1 if you "
@@ -112,6 +110,9 @@ googlebot_headers = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.6533.119 Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 }
 
+# Seconds to wait for a connection, then at most this long between bytes.
+REQUEST_TIMEOUT = (5, 20)
+
 jobs = {}
 jobs_lock = threading.Lock()
 
@@ -126,17 +127,14 @@ html = pages.HOME_TEMPLATE
 
 
 def build_steps(strings):
-    # Ordered the way fetch_article() tries sources, so the progress bar only
-    # moves forward. Each source is tried only if the previous ones did not
-    # return a complete article.
+    # One step per round of sources (see SOURCES), so the progress bar only
+    # moves forward. A round runs only if the previous ones did not return a
+    # complete article.
     return [
         {"id": "queued", "label": strings["step_queued"]},
         {"id": "connect", "label": strings["step_connect"]},
-        {"id": "fallback_freedium", "label": strings["step_fallback_freedium"]},
         {"id": "fetch", "label": strings["step_fetch"]},
-        {"id": "fallback_clean", "label": strings["step_fallback_clean"]},
-        {"id": "fallback_org", "label": strings["step_fallback_org"]},
-        {"id": "fallback_ph", "label": strings["step_fallback_ph"]},
+        {"id": "archives", "label": strings["step_archives"]},
         {"id": "fallback_headless", "label": strings["step_fallback_headless"]},
         {"id": "process", "label": strings["step_process"]},
         {"id": "cleanup", "label": strings["step_cleanup"]},
@@ -330,7 +328,7 @@ def fetch_via_freedium(url, job_id=None):
             resp = http_get(
                 freedium_url,
                 headers=REAL_BROWSER_HEADERS,
-                timeout=30,
+                timeout=REQUEST_TIMEOUT,
                 allow_redirects=True,
             )
             if resp.status_code != 200:
@@ -351,7 +349,7 @@ def fetch_via_archive_org(url, job_id=None):
     set_step(job_id, 'fallback_org')
     wayback_api = "https://archive.org/wayback/available"
     try:
-        meta = http_get(wayback_api, params={"url": url}, timeout=15).json()
+        meta = http_get(wayback_api, params={"url": url}, timeout=REQUEST_TIMEOUT).json()
         snapshot = meta.get("archived_snapshots", {}).get("closest", {})
         if not snapshot.get("available"):
             return None, None
@@ -364,7 +362,7 @@ def fetch_via_archive_org(url, job_id=None):
                 archived_url.split("/web/")[1].split("/")[0] + "id_",
                 1,
             )
-        resp = http_get(archived_url, headers=googlebot_headers, timeout=30)
+        resp = http_get(archived_url, headers=googlebot_headers, timeout=REQUEST_TIMEOUT)
         resp.encoding = resp.apparent_encoding
         return resp.text, resp.url
     except Exception:
@@ -380,7 +378,7 @@ def fetch_via_archive_ph(url, job_id=None):
             resp = http_get(
                 newest_url,
                 headers=REAL_BROWSER_HEADERS,
-                timeout=20,
+                timeout=REQUEST_TIMEOUT,
                 allow_redirects=True,
             )
             if resp.status_code != 200:
@@ -426,7 +424,7 @@ def decode_html(response):
 
 
 def _direct_fetch(url, headers):
-    response = http_get(url, headers=headers, timeout=30)
+    response = http_get(url, headers=headers, timeout=REQUEST_TIMEOUT)
     if response.status_code in ERROR_STATUSES or response.status_code >= 500:
         raise SourceMiss(f"HTTP {response.status_code}")
     return decode_html(response), response.url
@@ -456,16 +454,24 @@ def fetch_via_headless(url, job_id=None):
     return headless.fetch_rendered(url)
 
 
-# name -> (function name in this module, label shown to the user, text for a miss)
+# name -> (function name in this module, label shown to the user, text for a miss, round)
+#
+# Sources run in rounds. The sources of a round run at the same time and the
+# first complete article ends the search; the next round starts only when no
+# source in this one returned the full text. Round 1 asks the publisher, round
+# 2 the web archives, round 3 (optional) a headless browser.
 SOURCES = {
-    "freedium": ("fetch_via_freedium", "Freedium (Medium)", "no copy available"),
-    "googlebot": ("fetch_via_googlebot", "Googlebot request", "no usable response"),
-    "clean": ("fetch_via_clean", "Fresh browser request", "no usable response"),
-    "wayback": ("fetch_via_archive_org", "Wayback Machine", "no usable snapshot"),
-    "archive_today": ("fetch_via_archive_ph", "archive.today", "no usable snapshot, or blocked by a CAPTCHA"),
-    "headless": ("fetch_via_headless", "Headless browser", "no usable response"),
+    "freedium": ("fetch_via_freedium", "Freedium (Medium)", "no copy available", 1),
+    "googlebot": ("fetch_via_googlebot", "Googlebot request", "no usable response", 1),
+    "clean": ("fetch_via_clean", "Fresh browser request", "no usable response", 1),
+    "wayback": ("fetch_via_archive_org", "Wayback Machine", "no usable snapshot", 2),
+    "archive_today": ("fetch_via_archive_ph", "archive.today", "no usable snapshot, or blocked by a CAPTCHA", 2),
+    "headless": ("fetch_via_headless", "Headless browser", "no usable response", 3),
 }
 SOURCE_LABELS = {name: spec[1] for name, spec in SOURCES.items()}
+ROUND_STEPS = {1: "fetch", 2: "archives", 3: "fallback_headless"}
+# Longest wait for one round; whatever has arrived by then is used.
+ROUND_DEADLINE = 25
 DEFAULT_SOURCES = "googlebot,clean,wayback,archive_today,headless"
 OUTCOME_TEXT = {
     "complete": "full article",
@@ -475,11 +481,13 @@ OUTCOME_TEXT = {
     "empty": "nothing usable",
     "error": "request failed",
     "blocked": "refused by the network guard",
+    "skipped": "not needed",
+    "timeout": "no answer in time",
 }
 
 
 def configured_sources(url):
-    """Sources to try for *url*, in order (``SOURCES`` env var, comma-separated)."""
+    """Sources to use for *url* (``SOURCES`` env var, comma-separated), in order of preference."""
     names = [n.strip().lower() for n in os.environ.get("SOURCES", DEFAULT_SOURCES).split(",")]
     names = [n for n in dict.fromkeys(names) if n in SOURCES]
     if is_medium_url(url):
@@ -536,32 +544,9 @@ def _int_env(name, default, minimum=0):
         return default
 
 
-# How many articles may be fetched and extracted at the same time. Extraction
-# is CPU- and memory-heavy for a small board; FETCH_CONCURRENCY=1 makes a
-# second request wait ("queued") instead of competing with the first.
+# How many articles may be fetched at the same time; more requests wait their
+# turn ("queued") instead of competing for the network and CPU.
 FETCH_SLOTS = threading.BoundedSemaphore(_int_env("FETCH_CONCURRENCY", 2, minimum=1))
-
-
-def memory_available_mb(meminfo="/proc/meminfo"):
-    """MemAvailable in MB, or None where /proc/meminfo does not exist (macOS, Windows)."""
-    try:
-        with open(meminfo, encoding="ascii") as handle:
-            for line in handle:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) // 1024
-    except (OSError, ValueError, IndexError):
-        return None
-    return None
-
-
-def check_memory(strings):
-    """Refuse to start a fetch when MIN_FREE_MB is set and memory is short."""
-    needed = _int_env("MIN_FREE_MB", 0)
-    if not needed:
-        return
-    available = memory_available_mb()
-    if available is not None and available < needed:
-        raise UserFacingError(strings["low_memory_error"].format(available=available, needed=needed))
 
 
 def resolve_target(raw_url, strings):
@@ -580,10 +565,10 @@ def resolve_target(raw_url, strings):
 def fetch_article(url, strings, job_id=None, refresh=False):
     """Fetch, extract and archive the article at *url*; return the snapshot id.
 
-    Sources are tried in order. The first one that yields a complete-looking
-    article wins; otherwise the best partial copy is kept, with the reasons it
-    looks incomplete shown on the reader page. An article already in the
-    archive is returned as is unless *refresh* is set.
+    Sources run in rounds (see SOURCES); the first complete-looking article
+    wins. Otherwise the best partial copy is kept, with the reasons it looks
+    incomplete shown on the reader page. An article already in the archive is
+    returned as is unless *refresh* is set.
     """
     target = resolve_target(url, strings)
     key = urltools.archive_key(target)
@@ -598,48 +583,92 @@ def fetch_article(url, strings, job_id=None, refresh=False):
         FETCH_SLOTS.acquire()
     try:
         set_step(job_id, 'connect')
-        check_memory(strings)
         return _fetch_and_save(target, key, strings, job_id, store)
     finally:
         FETCH_SLOTS.release()
 
 
+def _fetch_source(name, target):
+    """Run one source; return (html, source_url). Called in a worker thread."""
+    return globals()[SOURCES[name][0]](target, None)  # no job id: the round sets the progress step
+
+
+def _evaluate(name, future, target, threshold):
+    """Turn one finished source into (attempt, candidate or None)."""
+    miss_text = SOURCES[name][2]
+    try:
+        html_text, source_url = future.result()
+    except SourceMiss as miss:
+        return _attempt(name, "empty", str(miss)), None
+    except netguard.BlockedTarget as blocked:
+        return _attempt(name, "blocked", blocked.reason), None
+    except requests.exceptions.RequestException as error:
+        return _attempt(name, "error", _describe_request_error(error)), None
+    except Exception as error:  # e.g. headless browser crashed: the other sources still count
+        app.logger.warning("Source %s failed for %s: %r", name, target, error)
+        return _attempt(name, "error", type(error).__name__), None
+    if not html_text:
+        return _attempt(name, "empty", miss_text), None
+    if is_challenge_page(html_text):
+        return _attempt(name, "challenge"), None
+    article = extract.extract_article(html_text, target, threshold)
+    if article is None:
+        return _attempt(name, "no_article"), None
+    outcome = "complete" if article.complete else "partial"
+    return _attempt(name, outcome, f"{article.word_count} words"), (name, article, html_text, source_url)
+
+
+def _run_round(names, target, threshold):
+    """Run *names* at the same time; stop at the first complete article.
+
+    Pages are downloaded in parallel and examined one by one as they arrive.
+    Returns (attempts in preference order, best candidate or None).
+    """
+    results = {}
+    best = None
+    complete = False
+    executor = ThreadPoolExecutor(max_workers=len(names), thread_name_prefix="source")
+    futures = {executor.submit(_fetch_source, name, target): name for name in names}
+    try:
+        for future in as_completed(futures, timeout=ROUND_DEADLINE):
+            name = futures[future]
+            attempt, candidate = _evaluate(name, future, target, threshold)
+            results[name] = attempt
+            if candidate and (best is None or candidate[1].score > best[1].score):
+                best = candidate
+            if candidate and candidate[1].complete:
+                complete = True
+                break
+    except FuturesTimeout:
+        pass
+    finally:
+        # Don't wait for slower sources once the answer is known; their
+        # requests end on their own timeouts in the background.
+        executor.shutdown(wait=False, cancel_futures=True)
+    attempts = []
+    for name in names:
+        if name in results:
+            attempts.append(results[name])
+        elif complete:
+            attempts.append(_attempt(name, "skipped", "a faster source had the full article"))
+        else:
+            attempts.append(_attempt(name, "timeout", f"no answer within {ROUND_DEADLINE} s"))
+    return attempts, best
+
+
 def _fetch_and_save(target, key, strings, job_id, store):
     threshold = min_words()
+    names = configured_sources(target)
     attempts = []
     best = None
-    for name in configured_sources(target):
-        function_name, _label, miss_text = SOURCES[name]
-        try:
-            html_text, source_url = globals()[function_name](target, job_id)
-        except SourceMiss as miss:
-            attempts.append(_attempt(name, "empty", str(miss)))
-            continue
-        except netguard.BlockedTarget as blocked:
-            attempts.append(_attempt(name, "blocked", blocked.reason))
-            continue
-        except requests.exceptions.RequestException as error:
-            attempts.append(_attempt(name, "error", _describe_request_error(error)))
-            continue
-        except Exception as error:  # e.g. headless browser crashed: try the next source
-            app.logger.warning("Source %s failed for %s: %r", name, target, error)
-            attempts.append(_attempt(name, "error", type(error).__name__))
-            continue
-
-        if not html_text:
-            attempts.append(_attempt(name, "empty", miss_text))
-            continue
-        if is_challenge_page(html_text):
-            attempts.append(_attempt(name, "challenge"))
-            continue
-        article = extract.extract_article(html_text, target, threshold)
-        if article is None:
-            attempts.append(_attempt(name, "no_article"))
-            continue
-        attempts.append(_attempt(name, "complete" if article.complete else "partial", f"{article.word_count} words"))
-        if best is None or article.score > best[1].score:
-            best = (name, article, html_text, source_url)
-        if article.complete:
+    for round_number in sorted({SOURCES[name][3] for name in names}):
+        set_step(job_id, ROUND_STEPS[round_number])
+        round_names = [name for name in names if SOURCES[name][3] == round_number]
+        round_attempts, candidate = _run_round(round_names, target, threshold)
+        attempts.extend(round_attempts)
+        if candidate and (best is None or candidate[1].score > best[1].score):
+            best = candidate
+        if best and best[1].complete:
             break
 
     if best is None:
@@ -712,7 +741,7 @@ def check_host_header():
         pass
     return Response(
         f"Host name '{hostname}' is not allowed. Add it to the ALLOWED_HOSTS "
-        "environment variable (comma-separated), e.g. ALLOWED_HOSTS=raspberrypi.local",
+        "environment variable (comma-separated), e.g. ALLOWED_HOSTS=reader.local",
         status=403,
         mimetype="text/plain",
     )
