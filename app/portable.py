@@ -1,3 +1,4 @@
+import ipaddress
 import json
 import os
 import flask
@@ -6,12 +7,22 @@ import requests
 import uuid
 import threading
 import time
+import math
+from datetime import datetime
 from functools import lru_cache
-from urllib.parse import urljoin, urlparse, quote, unquote
+from urllib.parse import urljoin, urlparse, urlsplit, quote, unquote
 from flask import request, Response
 from bs4 import BeautifulSoup
 
+from archivist import extract, headless, netguard, pages
+from archivist import store as archive_store
+from archivist import urls as urltools
+
 app = flask.Flask(__name__)
+
+# Outbound requests go through the network guard (public http(s) targets only,
+# checked on every redirect hop). Tests replace this with a fake.
+http_get = netguard.guarded_get
 
 _DEFAULT_STRINGS = {
     "heading": "Enter Website Link",
@@ -29,6 +40,15 @@ _DEFAULT_STRINGS = {
     "step_fallback_freedium": "Trying Freedium (Medium bypass)...",
     "step_fallback_org": "Trying archive.org snapshot...",
     "step_fallback_ph": "Trying archive.today / archive.ph snapshot...",
+    "step_fallback_clean": "Trying a fresh browser request (no cookies)...",
+    "step_fallback_headless": "Rendering in a headless browser with paywall scripts blocked...",
+    "library_link": "Library",
+    "blocked_target_error": (
+        "Refusing to fetch this address: it is not an http(s) URL, or it points "
+        "to a private or local network. Set ALLOW_PRIVATE_TARGETS=1 if you "
+        "really want to read pages from your own network."
+    ),
+    "nothing_found_error": "No readable copy of the article could be retrieved.",
     "step_process": "Processing article...",
     "step_cleanup": "Cleaning up & preparing view...",
     "step_done": "Done!",
@@ -85,10 +105,6 @@ googlebot_headers = {
 
 jobs = {}
 jobs_lock = threading.Lock()
-
-page_cache = {}
-page_cache_lock = threading.Lock()
-PAGE_CACHE_TTL = 300
 
 
 class UserFacingError(Exception):
@@ -166,6 +182,17 @@ html = """
             top: 10px;
             right: 10px;
         }
+
+        .library-link {
+            position: absolute;
+            top: 14px;
+            left: 16px;
+            color: #a327f0;
+            font-weight: 600;
+            text-decoration: none;
+        }
+
+        body.dark-mode .library-link { color: #b18cff; }
 
         .dark-mode-toggle input {
             position: absolute;
@@ -395,6 +422,7 @@ html = """
 </head>
 
 <body>
+    <a class="library-link" href="/library">{{ library_link }}</a>
     <div class="dark-mode-toggle">
         <input type="checkbox" id="dark-mode-toggle">
         <label for="dark-mode-toggle" title="{{ toggle_dark_mode }}">
@@ -510,10 +538,21 @@ html = """
             area.appendChild(retry);
         }
 
+        const AUTOSTART = {{ autostart | tojson }};
+
         document.getElementById('url-form').addEventListener('submit', function(e) {
             e.preventDefault();
             const link = document.getElementById('link').value.trim();
             if (!link) return;
+            startFetch(link, false);
+        });
+
+        if (AUTOSTART && AUTOSTART.url) {
+            document.getElementById('link').value = AUTOSTART.url;
+            startFetch(AUTOSTART.url, AUTOSTART.refresh);
+        }
+
+        function startFetch(link, refresh) {
             showStatus(link);
 
             const startTime = Date.now();
@@ -525,7 +564,7 @@ html = """
                 elapsedEl.textContent = UI_STRINGS.elapsed_template.replace('{seconds}', sec);
             }, 500);
 
-            const evtSource = new EventSource('/status?url=' + encodeURIComponent(link));
+            const evtSource = new EventSource('/status?url=' + encodeURIComponent(link) + (refresh ? '&refresh=1' : ''));
 
             evtSource.addEventListener('step', function(e) {
                 const data = JSON.parse(e.data);
@@ -558,7 +597,7 @@ html = """
                 clearInterval(timer);
                 showError(UI_STRINGS.connection_lost_error);
             };
-        });
+        }
 
         window.addEventListener('pageshow', function(event) {
             if (event.persisted) {
@@ -575,20 +614,24 @@ html = """
 
 
 def build_steps(strings):
+    # Ordered the way fetch_article() tries sources, so the progress bar only
+    # moves forward. Each source is tried only if the previous ones did not
+    # return a complete article.
     return [
         {"id": "connect", "label": strings["step_connect"]},
-        {"id": "fetch", "label": strings["step_fetch"]},
-        {"id": "detect", "label": strings["step_detect"]},
         {"id": "fallback_freedium", "label": strings["step_fallback_freedium"]},
+        {"id": "fetch", "label": strings["step_fetch"]},
+        {"id": "fallback_clean", "label": strings["step_fallback_clean"]},
         {"id": "fallback_org", "label": strings["step_fallback_org"]},
         {"id": "fallback_ph", "label": strings["step_fallback_ph"]},
+        {"id": "fallback_headless", "label": strings["step_fallback_headless"]},
         {"id": "process", "label": strings["step_process"]},
         {"id": "cleanup", "label": strings["step_cleanup"]},
         {"id": "done", "label": strings["step_done"]},
     ]
 
 
-def render_main_page():
+def render_main_page(autostart=None):
     strings = load_strings()
     ui_strings = {
         "error_title": strings["error_title"],
@@ -600,6 +643,7 @@ def render_main_page():
         html,
         steps=build_steps(strings),
         ui_strings=ui_strings,
+        autostart=autostart,
         **strings,
     )
 
@@ -761,7 +805,7 @@ def fetch_via_freedium(url, job_id=None):
     for mirror in FREEDIUM_MIRRORS:
         try:
             freedium_url = f"https://{mirror}/{clean_url}"
-            resp = requests.get(
+            resp = http_get(
                 freedium_url,
                 headers=REAL_BROWSER_HEADERS,
                 timeout=30,
@@ -785,7 +829,7 @@ def fetch_via_archive_org(url, job_id=None):
     set_step(job_id, 'fallback_org')
     wayback_api = "https://archive.org/wayback/available"
     try:
-        meta = requests.get(wayback_api, params={"url": url}, timeout=15).json()
+        meta = http_get(wayback_api, params={"url": url}, timeout=15).json()
         snapshot = meta.get("archived_snapshots", {}).get("closest", {})
         if not snapshot.get("available"):
             return None, None
@@ -798,7 +842,7 @@ def fetch_via_archive_org(url, job_id=None):
                 archived_url.split("/web/")[1].split("/")[0] + "id_",
                 1,
             )
-        resp = requests.get(archived_url, headers=googlebot_headers, timeout=30)
+        resp = http_get(archived_url, headers=googlebot_headers, timeout=30)
         resp.encoding = resp.apparent_encoding
         return resp.text, resp.url
     except Exception:
@@ -811,7 +855,7 @@ def fetch_via_archive_ph(url, job_id=None):
     for mirror in ARCHIVE_PH_MIRRORS:
         try:
             newest_url = f"https://{mirror}/newest/{quote(url, safe=':/')}"
-            resp = requests.get(
+            resp = http_get(
                 newest_url,
                 headers=REAL_BROWSER_HEADERS,
                 timeout=20,
@@ -840,115 +884,294 @@ def fetch_via_archive_ph(url, job_id=None):
     return None, None
 
 
-def bypass_paywall(url, strings, job_id=None):
-    set_step(job_id, 'connect')
+# --------------------------------------------------------------------------
+# Additional sources
+# --------------------------------------------------------------------------
 
-    if not url.startswith("http"):
-        url = "https://" + url
+class SourceMiss(Exception):
+    """A source answered, but not with anything usable (e.g. HTTP 403)."""
 
-    medium = is_medium_url(url)
-    html_text = ""
-    final_url = url
 
-    if medium:
-        freedium_html, freedium_final = fetch_via_freedium(url, job_id)
-        if freedium_html:
-            set_step(job_id, 'process')
-            result = process_html_document(freedium_html, freedium_final)
-            set_step(job_id, 'cleanup')
-            return result
-    else:
-        set_step(job_id, 'fetch')
-        response = requests.get(url, headers=googlebot_headers, timeout=30)
+ERROR_STATUSES = (401, 402, 403, 404, 407, 410, 429, 451)
+
+
+def decode_html(response):
+    """Use the charset the server declared; otherwise detect it from the bytes."""
+    content_type = (response.headers.get("content-type") or "").lower()
+    if "charset=" not in content_type:
         response.encoding = response.apparent_encoding
-        html_text = response.text
-        final_url = response.url
+    return response.text
 
-        # Treat error status codes as a challenge so the archive fallbacks trigger.
-        # Sites like News24 return 403 with their homepage HTML (which contains a
-        # JS redirect back to the homepage), causing the browser to redirect away.
-        if response.status_code in (401, 403, 407, 429) or response.status_code >= 500:
-            html_text = ""
 
-    set_step(job_id, 'detect')
-    if not html_text or is_challenge_page(html_text):
-        recovered = False
+def _direct_fetch(url, headers):
+    response = http_get(url, headers=headers, timeout=30)
+    if response.status_code in ERROR_STATUSES or response.status_code >= 500:
+        raise SourceMiss(f"HTTP {response.status_code}")
+    return decode_html(response), response.url
 
-        archived_html, archived_url = fetch_via_archive_org(url, job_id)
-        if archived_html and not is_challenge_page(archived_html):
-            html_text = archived_html
-            final_url = archived_url
-            recovered = True
 
-        if not recovered:
-            archived_html, archived_url = fetch_via_archive_ph(url, job_id)
-            if archived_html and not is_challenge_page(archived_html):
-                html_text = archived_html
-                final_url = archived_url
-                recovered = True
+def fetch_via_googlebot(url, job_id=None):
+    """13ft's original method: ask for the page the way Google's crawler would."""
+    set_step(job_id, 'fetch')
+    return _direct_fetch(url, googlebot_headers)
 
-        if not recovered:
-            if medium:
-                msg = strings["medium_challenge_error"]
-            else:
-                msg = strings["challenge_error"]
-            raise UserFacingError(msg)
+
+def fetch_via_clean(url, job_id=None):
+    """An ordinary browser request with no cookies, arriving from a search.
+
+    Metered paywalls count free articles in cookies; a request without any
+    starts the count from zero. Some sites also open articles to visitors
+    who arrive from a search engine.
+    """
+    set_step(job_id, 'fallback_clean')
+    headers = dict(REAL_BROWSER_HEADERS)
+    headers["Referer"] = "https://www.google.com/"
+    return _direct_fetch(url, headers)
+
+
+def fetch_via_headless(url, job_id=None):
+    set_step(job_id, 'fallback_headless')
+    return headless.fetch_rendered(url)
+
+
+# name -> (function name in this module, label shown to the user, text for a miss)
+SOURCES = {
+    "freedium": ("fetch_via_freedium", "Freedium (Medium)", "no copy available"),
+    "googlebot": ("fetch_via_googlebot", "Googlebot request", "no usable response"),
+    "clean": ("fetch_via_clean", "Fresh browser request", "no usable response"),
+    "wayback": ("fetch_via_archive_org", "Wayback Machine", "no usable snapshot"),
+    "archive_today": ("fetch_via_archive_ph", "archive.today", "no usable snapshot, or blocked by a CAPTCHA"),
+    "headless": ("fetch_via_headless", "Headless browser", "no usable response"),
+}
+SOURCE_LABELS = {name: spec[1] for name, spec in SOURCES.items()}
+DEFAULT_SOURCES = "googlebot,clean,wayback,archive_today,headless"
+OUTCOME_TEXT = {
+    "complete": "full article",
+    "partial": "incomplete article",
+    "challenge": "bot-protection or CAPTCHA page",
+    "no_article": "no article text found",
+    "empty": "nothing usable",
+    "error": "request failed",
+    "blocked": "refused by the network guard",
+}
+
+
+def configured_sources(url):
+    """Sources to try for *url*, in order (``SOURCES`` env var, comma-separated)."""
+    names = [n.strip().lower() for n in os.environ.get("SOURCES", DEFAULT_SOURCES).split(",")]
+    names = [n for n in dict.fromkeys(names) if n in SOURCES]
+    if is_medium_url(url):
+        if "freedium" not in names:
+            names.insert(0, "freedium")
+    else:
+        names = [n for n in names if n != "freedium"]
+    if "headless" in names and not headless.enabled():
+        names.remove("headless")
+    return names
+
+
+def min_words():
+    try:
+        return max(1, int(os.environ.get("MIN_WORDS", extract.DEFAULT_MIN_WORDS)))
+    except ValueError:
+        return extract.DEFAULT_MIN_WORDS
+
+
+def _attempt(name, outcome, detail=""):
+    return {
+        "source": name,
+        "label": SOURCE_LABELS.get(name, name),
+        "outcome": outcome,
+        "outcome_text": OUTCOME_TEXT.get(outcome, outcome),
+        "detail": detail,
+    }
+
+
+def _describe_request_error(error):
+    if isinstance(error, requests.exceptions.Timeout):
+        return "timed out"
+    if isinstance(error, requests.exceptions.ConnectionError):
+        return "could not connect"
+    if isinstance(error, requests.exceptions.TooManyRedirects):
+        return "too many redirects"
+    return type(error).__name__
+
+
+def summarize_attempts(attempts):
+    parts = []
+    for a in attempts:
+        text = f"{a['label']}: {a['outcome_text']}"
+        if a["detail"]:
+            text += f" ({a['detail']})"
+        parts.append(text)
+    return "Tried " + "; ".join(parts) + "." if parts else ""
+
+
+def resolve_target(raw_url, strings):
+    """User input -> fetchable URL without tracking parameters, or UserFacingError."""
+    target = urltools.parse_target(raw_url)
+    if not target:
+        raise UserFacingError(strings["invalid_url"])
+    target = urltools.strip_tracking(target)
+    try:
+        netguard.check_url(target)
+    except netguard.BlockedTarget:
+        raise UserFacingError(strings["blocked_target_error"]) from None
+    return target
+
+
+def fetch_article(url, strings, job_id=None, refresh=False):
+    """Fetch, extract and archive the article at *url*; return the snapshot id.
+
+    Sources are tried in order. The first one that yields a complete-looking
+    article wins; otherwise the best partial copy is kept, with the reasons it
+    looks incomplete shown on the reader page. An article already in the
+    archive is returned as is unless *refresh* is set.
+    """
+    set_step(job_id, 'connect')
+    target = resolve_target(url, strings)
+    key = urltools.archive_key(target)
+    store = archive_store.get_store()
+    if not refresh:
+        existing = store.latest_for(key)
+        if existing:
+            return existing["id"]
+
+    threshold = min_words()
+    attempts = []
+    best = None
+    for name in configured_sources(target):
+        function_name, _label, miss_text = SOURCES[name]
+        try:
+            html_text, source_url = globals()[function_name](target, job_id)
+        except SourceMiss as miss:
+            attempts.append(_attempt(name, "empty", str(miss)))
+            continue
+        except netguard.BlockedTarget as blocked:
+            attempts.append(_attempt(name, "blocked", blocked.reason))
+            continue
+        except requests.exceptions.RequestException as error:
+            attempts.append(_attempt(name, "error", _describe_request_error(error)))
+            continue
+        except Exception as error:  # e.g. headless browser crashed: try the next source
+            app.logger.warning("Source %s failed for %s: %r", name, target, error)
+            attempts.append(_attempt(name, "error", type(error).__name__))
+            continue
+
+        if not html_text:
+            attempts.append(_attempt(name, "empty", miss_text))
+            continue
+        if is_challenge_page(html_text):
+            attempts.append(_attempt(name, "challenge"))
+            continue
+        article = extract.extract_article(html_text, target, threshold)
+        if article is None:
+            attempts.append(_attempt(name, "no_article"))
+            continue
+        attempts.append(_attempt(name, "complete" if article.complete else "partial", f"{article.word_count} words"))
+        if best is None or article.score > best[1].score:
+            best = (name, article, html_text, source_url)
+        if article.complete:
+            break
+
+    if best is None:
+        raise UserFacingError(f"{strings['nothing_found_error']} {summarize_attempts(attempts)}".strip())
 
     set_step(job_id, 'process')
-    result = process_html_document(html_text, final_url)
-
+    name, article, html_text, source_url = best
+    keep_raw = os.environ.get("STORE_RAW_HTML", "1").strip().lower() not in ("0", "false", "no", "off")
     set_step(job_id, 'cleanup')
-    return result
+    return store.save(
+        url=target,
+        url_key=key,
+        source_url=source_url or target,
+        method=name,
+        title=article.title,
+        byline=article.byline,
+        published=article.published,
+        site_name=article.site_name,
+        content_source=article.content_source,
+        content_html=article.content_html,
+        content_text=article.content_text,
+        word_count=article.word_count,
+        complete=article.complete,
+        warnings=article.warnings,
+        attempts=attempts,
+        raw_html=html_text if keep_raw else None,
+    )
 
 
-def normalize_cache_url(url):
-    if "://" in url:
-        return "https://" + url.split("://", 1)[1]
-    return "https://" + url
-
-
-def clean_page_cache():
-    now = time.time()
-    expired = [k for k, v in page_cache.items() if now - v['timestamp'] > PAGE_CACHE_TTL]
-    for k in expired:
-        del page_cache[k]
-
-
-def fetch_worker(job_id, url, strings):
+def fetch_worker(job_id, url, strings, refresh=False):
     try:
-        result = bypass_paywall(url, strings, job_id)
-        # Never cache challenge/error pages — only store clean article HTML.
-        if not is_challenge_page(result):
-            cache_key = normalize_cache_url(url)
-            with page_cache_lock:
-                clean_page_cache()
-                page_cache[cache_key] = {'html': result, 'timestamp': time.time()}
-        else:
-            cache_key = normalize_cache_url(url)
+        snapshot_id = fetch_article(url, strings, job_id, refresh=refresh)
         with jobs_lock:
-            jobs[job_id]['result'] = cache_key
+            jobs[job_id]['result'] = f"/read/{snapshot_id}"
             jobs[job_id]['step'] = 'done'
-    except requests.exceptions.Timeout:
-        with jobs_lock:
-            jobs[job_id]['error'] = strings["timeout_error"]
-            jobs[job_id]['step'] = 'error'
-    except requests.exceptions.ConnectionError:
-        with jobs_lock:
-            jobs[job_id]['error'] = strings["connection_error"]
-            jobs[job_id]['step'] = 'error'
-    except requests.exceptions.RequestException as e:
-        with jobs_lock:
-            jobs[job_id]['error'] = strings["request_error"]
-            jobs[job_id]['step'] = 'error'
     except UserFacingError as error:
         with jobs_lock:
             jobs[job_id]['error'] = error.user_message
             jobs[job_id]['step'] = 'error'
-    except Exception as e:
+    except Exception:
+        app.logger.exception("Unexpected error while fetching %s", url)
         with jobs_lock:
             jobs[job_id]['error'] = strings["unexpected_error"]
             jobs[job_id]['step'] = 'error'
 
+
+# --------------------------------------------------------------------------
+# Request hygiene for a server that runs on your own machine
+# --------------------------------------------------------------------------
+
+def _allowed_hosts():
+    return {h.strip().lower() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()}
+
+
+@app.before_request
+def check_host_header():
+    """Answer only to localhost, IP addresses and names listed in ALLOWED_HOSTS.
+
+    Without this, a malicious web page could use DNS rebinding to point its
+    own domain at 127.0.0.1 and read your library from its own origin.
+    """
+    hostname = (urlsplit("//" + (request.host or "")).hostname or "").lower()
+    allowed = _allowed_hosts()
+    if "*" in allowed or hostname in allowed or hostname == "localhost":
+        return None
+    try:
+        ipaddress.ip_address(hostname)
+        return None
+    except ValueError:
+        pass
+    return Response(
+        f"Host name '{hostname}' is not allowed. Add it to the ALLOWED_HOSTS "
+        "environment variable (comma-separated), e.g. ALLOWED_HOSTS=raspberrypi.local",
+        status=403,
+        mimetype="text/plain",
+    )
+
+
+def is_cross_site_request():
+    """True for form posts that another website made your browser send."""
+    site = request.headers.get("Sec-Fetch-Site")
+    if site is not None:
+        return site not in ("same-origin", "none")
+    origin = request.headers.get("Origin")
+    if origin:
+        return urlsplit(origin).netloc.lower() != (request.host or "").lower()
+    return False  # non-browser clients (curl, scripts)
+
+
+@app.template_filter("when")
+def format_timestamp(value):
+    try:
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M UTC")
+    except (TypeError, ValueError):
+        return value or ""
+
+
+# --------------------------------------------------------------------------
+# Routes
+# --------------------------------------------------------------------------
 
 @app.route("/favicon.ico")
 def favicon():
@@ -961,15 +1184,23 @@ def favicon():
     return "", 404
 
 
+@app.route("/robots.txt")
+def robots():
+    return Response("User-agent: *\nDisallow: /\n", mimetype="text/plain")
+
+
 @app.route("/")
 def main_page():
-    return render_main_page()
+    url = request.args.get("url", "").strip()
+    autostart = {"url": url, "refresh": request.args.get("refresh") == "1"} if url else None
+    return render_main_page(autostart)
 
 
 @app.route("/status")
 def status_stream():
     raw_url = request.args.get("url", "")
     url = unquote(raw_url)
+    refresh = request.args.get("refresh") == "1"
 
     if not url:
         return "Missing URL", 400
@@ -979,7 +1210,7 @@ def status_stream():
     with jobs_lock:
         jobs[job_id] = {'step': 'queued', 'result': None, 'error': None}
 
-    thread = threading.Thread(target=fetch_worker, args=(job_id, url, strings))
+    thread = threading.Thread(target=fetch_worker, args=(job_id, url, strings, refresh))
     thread.daemon = True
     thread.start()
 
@@ -996,7 +1227,7 @@ def status_stream():
                 if current != last_step:
                     last_step = current
                     if current == 'done':
-                        yield f"event: step\ndata: {json.dumps({'step': 'done', 'redirect': '/' + job['result']})}\n\n"
+                        yield f"event: step\ndata: {json.dumps({'step': 'done', 'redirect': job['result']})}\n\n"
                         break
                     elif current == 'error':
                         yield f"event: error_msg\ndata: {json.dumps({'message': job['error']})}\n\n"
@@ -1015,51 +1246,136 @@ def status_stream():
 
 @app.route("/article", methods=["POST"])
 def show_article():
+    """Form fallback for browsers without JavaScript: fetch, then redirect."""
     link = flask.request.form["link"]
     strings = load_strings()
     try:
-        return bypass_paywall(link, strings)
-    except requests.exceptions.Timeout:
-        return strings["timeout_error"], 400
-    except requests.exceptions.ConnectionError:
-        return strings["connection_error"], 400
-    except requests.exceptions.RequestException:
-        return strings["request_error"], 400
+        snapshot_id = fetch_article(link, strings)
     except UserFacingError as error:
         return error.user_message, 400
     except Exception:
+        app.logger.exception("Unexpected error while fetching %s", link)
         return strings["unexpected_error"], 500
+    return flask.redirect(f"/read/{snapshot_id}", code=303)
 
 
-@app.route("/", defaults={"path": ""})
+def _snapshot_or_404(snapshot_id):
+    snapshot = archive_store.get_store().get(snapshot_id)
+    if snapshot is None:
+        flask.abort(404)
+    return snapshot
+
+
+@app.route("/read/<int:snapshot_id>")
+def read_snapshot(snapshot_id):
+    snapshot = _snapshot_or_404(snapshot_id)
+    body = flask.render_template_string(
+        pages.READER_TEMPLATE,
+        snap=snapshot,
+        versions=archive_store.get_store().versions(snapshot["url_key"]),
+        method_label=SOURCE_LABELS.get(snapshot["method"], snapshot["method"]),
+        labels=SOURCE_LABELS,
+        reading_minutes=max(1, math.ceil(snapshot["word_count"] / 230)),
+    )
+    return Response(body, mimetype="text/html", headers={
+        "Content-Security-Policy": pages.READER_CSP,
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
+@app.route("/read/<int:snapshot_id>/original")
+def read_snapshot_original(snapshot_id):
+    """The saved page in its original layout, isolated from this server.
+
+    The ``sandbox`` CSP gives the page an opaque origin, so publisher scripts
+    (if enabled with ?js=1) cannot read your library or anything else on this
+    server. Scripts are off by default, which also keeps paywall overlays off.
+    """
+    snapshot = _snapshot_or_404(snapshot_id)
+    raw = archive_store.get_store().raw_html(snapshot_id)
+    if raw is None:
+        flask.abort(404)
+    # Wayback "id_" snapshots are the publisher's own HTML, so relative links
+    # belong to the publisher; other sources are resolved against where they came from.
+    base = snapshot["url"] if snapshot["method"] == "wayback" else (snapshot["source_url"] or snapshot["url"])
+    sandbox = "sandbox allow-popups allow-popups-to-escape-sandbox"
+    if request.args.get("js") == "1":
+        sandbox += " allow-scripts"
+    return Response(process_html_document(raw, base), mimetype="text/html", headers={
+        "Content-Security-Policy": sandbox,
+        "Referrer-Policy": "no-referrer",
+    })
+
+
+LIBRARY_PAGE_SIZE = 50
+
+
+@app.route("/library")
+def library():
+    query = request.args.get("q", "").strip()
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        page = 1
+    items, total = archive_store.get_store().search(query, LIBRARY_PAGE_SIZE, (page - 1) * LIBRARY_PAGE_SIZE)
+    body = flask.render_template_string(
+        pages.LIBRARY_TEMPLATE,
+        items=items,
+        total=total,
+        q=query,
+        page=page,
+        pages=max(1, math.ceil(total / LIBRARY_PAGE_SIZE)),
+        labels=SOURCE_LABELS,
+    )
+    return Response(body, mimetype="text/html", headers={
+        "Content-Security-Policy": pages.LIBRARY_CSP,
+        "Referrer-Policy": "no-referrer",
+    })
+
+
+@app.route("/library/<int:snapshot_id>/delete", methods=["POST"])
+def delete_snapshot(snapshot_id):
+    if is_cross_site_request():
+        return "Cross-site request refused", 403
+    if not archive_store.get_store().delete(snapshot_id):
+        flask.abort(404)
+    return flask.redirect("/library", code=303)
+
+
+def _raw_request_target():
+    """The path and query exactly as the browser sent them."""
+    raw = request.environ.get("RAW_URI") or request.environ.get("REQUEST_URI")
+    if not raw:
+        raw = request.full_path.rstrip("?")
+    return raw[1:] if raw.startswith("/") else raw
+
+
 @app.route("/<path:path>", methods=["GET"])
 def get_article(path):
+    """``http://127.0.0.1:5000/https://example.com/story`` style links.
+
+    An article already in the library opens straight away; otherwise the
+    progress page starts fetching it.
+    """
     strings = load_strings()
-    full_url = request.url
-    parts = full_url.split("/", 4)
-    if len(parts) >= 5:
-        actual_url = "https://" + parts[4].lstrip("/")
-
-        with page_cache_lock:
-            cached = page_cache.get(actual_url)
-        if cached:
-            return cached['html']
-
-        try:
-            return bypass_paywall(actual_url, strings)
-        except requests.exceptions.Timeout:
-            return strings["timeout_error"], 400
-        except requests.exceptions.ConnectionError:
-            return strings["connection_error"], 400
-        except requests.exceptions.RequestException:
-            return strings["request_error"], 400
-        except UserFacingError as error:
-            return error.user_message, 400
-        except Exception:
-            return strings["unexpected_error"], 500
-    else:
+    target = urltools.parse_target(_raw_request_target())
+    if not target:
         return strings["invalid_url"], 400
+    target = urltools.strip_tracking(target)
+    existing = archive_store.get_store().latest_for(urltools.archive_key(target))
+    if existing:
+        return flask.redirect(f"/read/{existing['id']}", code=302)
+    return render_main_page({"url": target, "refresh": False})
+
+
+def main():
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT") or 5000)
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print(f" * Listening on {host}: other devices on your network can reach this server.")
+    app.run(host=host, port=port, debug=False, threaded=True)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=os.getenv("PORT") or 5000, debug=False)
+    main()
