@@ -19,6 +19,93 @@ It pretends to be GoogleBot (Google's web crawler) and gets the same content tha
 
 The server now displays a loading/status page while it fetches the target article and will automatically try multiple bypass methods (multi-source fallbacks) if the primary approach fails. This improves compatibility with sites that employ stronger paywalls or blocking behaviour. Feature courtesy of [@JRS1986](https://github.com/JRS1986)
 
+## This fork: reader view, personal archive, hardening
+
+This branch turns 13ft into a self-hosted replacement for archive.ph for one person.
+
+- **Reader view.** The article is extracted with [Trafilatura](https://github.com/adbar/trafilatura), or taken from the page's JSON-LD `articleBody` when that is fuller, and shown on a clean page with no publisher scripts. This removes script-driven overlays and recovers text that a paywall only hides with CSS.
+- **It checks whether the copy is complete.** It checks for a "subscribe to continue" prompt after a short text, and compares against the publisher's own `wordCount`. If a source gives only a teaser, the next source is tried. If none gives a full copy, the longest one is kept and the reader page says why it may be incomplete.
+- **Personal archive.** Every article is saved to a local SQLite file, with full-text search, all saved copies of each article, and the saved page in its original layout. Opening a link you've read before is instant, and the copy survives if the publisher edits or removes the page.
+- **Safer to run.**
+  - It listens on `127.0.0.1` by default.
+  - It refuses to fetch private or local network addresses, re-checked on every redirect.
+  - It only answers to `localhost`, IP addresses and names listed in `ALLOWED_HOSTS`, which blocks DNS rebinding.
+  - The reader and library pages forbid scripts through a Content Security Policy.
+  - The saved original layout is served in a CSP sandbox, so a publisher's scripts can never read your library.
+- **Tracking parameters removed.** `utm_*`, newsletter IDs (`st_*`, `mc_*`) and similar are stripped before the publisher is contacted.
+
+### Sources, in the order they are tried
+
+| Name (`SOURCES`) | What it does |
+| --- | --- |
+| `freedium` | Medium articles only, through Freedium (upstream behaviour). |
+| `googlebot` | Requests the page with Google's crawler user agent (13ft's original method). |
+| `clean` | An ordinary browser request with no cookies and a search-engine referrer. This resets "N free articles" meters kept in cookies. |
+| `wayback` | The latest Internet Archive snapshot (raw `id_` copy). |
+| `archive_today` | The latest archive.today snapshot, if one exists and no CAPTCHA is shown. |
+| `headless` | Optional. Renders the page in headless Chromium with known paywall-vendor scripts (Piano/Tinypass, Poool, Pelcro, …) blocked. Off unless `HEADLESS=on`. |
+
+What to expect, honestly:
+- **Metered paywalls and overlay paywalls** (the text is in the page, then hidden) usually work.
+- **Server-side "hard" paywalls** send only a teaser and verify Googlebot by reverse DNS. These only work when a public archive already has a full snapshot.
+- **Sites behind bot protection** (Cloudflare, DataDome, …) are not bypassed. This fork deliberately does not solve CAPTCHAs or challenges.
+
+The "How this copy was obtained" section at the bottom of each reader page lists what each source returned.
+
+### Run it
+
+```sh
+python -m pip install -r requirements.txt
+cd app && python portable.py          # http://127.0.0.1:5000
+```
+
+Or with Docker (builds this checkout; the port is published on 127.0.0.1 only and the archive lives in a named volume):
+
+```sh
+docker compose up -d --build
+```
+
+Optional headless source (not in the Alpine image, because Playwright needs glibc):
+
+```sh
+python -m pip install -r requirements-headless.txt
+python -m playwright install chromium
+HEADLESS=on python app/portable.py
+```
+
+### Ways to open an article
+
+- Paste the link on the home page.
+- Put the server address in front of any link: `http://127.0.0.1:5000/https://example.com/story`.
+- **Bookmarklet.** Create a bookmark with this URL, then click it on any article:
+  `javascript:location.href='http://127.0.0.1:5000/'+location.href`
+- **Address-bar keyword.** Add a site search in Chrome/Edge (Settings → Search engine → Manage → Site search) or a keyword bookmark in Firefox:
+  - URL: `http://127.0.0.1:5000/?url=%s`
+  - Shortcut: `rt`
+  
+  Then type `rt <link>` in the address bar.
+
+### Configuration (environment variables)
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HOST` / `PORT` | `127.0.0.1` / `5000` | Listen address. Use `0.0.0.0` to serve other devices, and then set `ALLOWED_HOSTS`. |
+| `ALLOWED_HOSTS` | *(empty)* | Extra host names the server answers to, e.g. `raspberrypi.local`. `localhost` and IP addresses always work. |
+| `DATA_DIR` | `./data` (`/data` in Docker) | Where `archive.sqlite3` is kept. |
+| `SOURCES` | `googlebot,clean,wayback,archive_today,headless` | Which sources to try, in order. |
+| `MIN_WORDS` | `150` | Below this, a copy counts as "short" and the next source is tried. |
+| `HEADLESS` | `off` | `on` enables the headless-browser source (needs Playwright). |
+| `CHROMIUM_PATH` | *(Playwright's)* | Use a specific Chromium binary for the headless source. |
+| `BLOCK_SCRIPT_HOSTS` | *(empty)* | Extra script hosts to block in the headless source, comma-separated. |
+| `STORE_RAW_HTML` | `1` | Keep the fetched page (compressed) for the "Saved layout" view. `0` keeps only the extracted text. |
+| `ALLOW_PRIVATE_TARGETS` | `0` | `1` lets the server fetch private or local addresses (e.g. pages on your LAN). |
+
+The `api/index.py` / `vercel.json` deployment from upstream still exists. It is not recommended with this fork: the archive would not persist there, and a public instance is what got 12ft.io taken down.
+
+### A note on legality
+
+Getting around a paywall usually breaks the publisher's terms of service. Depending on where you live, it can also raise copyright questions: US publishers have argued that paywall-bypass tools violate DMCA §1201. This fork is meant for private, single-user use on your own machine. It doesn't defeat logins, CAPTCHAs or bot protection, and it doesn't share content with anyone. Check your local law, and consider subscribing to the outlets you rely on.
+
 
 ## How do I use it?
 

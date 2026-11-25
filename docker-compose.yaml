@@ -2,7 +2,20 @@ services:
   13ft:
     container_name: 13ft
     hostname: 13ft
-    image: ghcr.io/wasi-master/13ft:latest
+    # Built from this checkout, so the image contains this fork's changes.
+    build:
+      context: .
     restart: unless-stopped
     ports:
-      - "5000:5000"
+      # Reachable from this computer only. To use it from other devices on your
+      # network, change this to "5000:5000" and set ALLOWED_HOSTS below.
+      - "127.0.0.1:5000:5000"
+    environment:
+      - LOCALE=en
+      # - ALLOWED_HOSTS=raspberrypi.local
+      # - SOURCES=googlebot,clean,wayback,archive_today
+    volumes:
+      - 13ft-data:/data
+
+volumes:
+  13ft-data:
