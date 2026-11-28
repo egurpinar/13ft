@@ -21,7 +21,7 @@ The server now displays a loading/status page while it fetches the target articl
 
 ## This fork: reader view, personal archive, hardening
 
-This branch turns 13ft into a self-hosted replacement for archive.ph for one person.
+This fork turns 13ft into a self-hosted replacement for archive.ph for one person.
 
 - **Reader view.** The article is extracted with [Trafilatura](https://github.com/adbar/trafilatura), or taken from the page's JSON-LD `articleBody` when that is fuller, and shown on a clean page with no publisher scripts. This removes script-driven overlays and recovers text that a paywall only hides with CSS.
 - **It checks whether the copy is complete.** It checks for a "subscribe to continue" prompt after a short text, and compares against the publisher's own `wordCount`. If the page has only a teaser, the web archives are asked next. If no source gives a full copy, the longest one is kept and the reader page says why it may be incomplete.
@@ -61,7 +61,7 @@ The "How this copy was obtained" section at the bottom of each reader page lists
 **On a Mac** (one command in Terminal; needs Python 3.9 or newer, which macOS offers to install if it's missing):
 
 ```sh
-cd "$(mktemp -d)" && curl -fsSL https://github.com/egurpinar/13ft/archive/refs/heads/reader-archive.tar.gz | tar xz && bash 13ft-reader-archive/deploy/macos/install.sh
+cd "$(mktemp -d)" && curl -fsSL https://github.com/egurpinar/13ft/archive/refs/heads/main.tar.gz | tar xz && bash 13ft-main/deploy/macos/install.sh
 ```
 
 It installs into `~/Library/Application Support/13ft`, starts when you log in (a LaunchAgent), restarts itself if it ever crashes, and opens **http://localhost:8013** (port 8013 because macOS's AirPlay Receiver uses 5000). Only your Mac can reach it. When idle it uses no CPU and about 50 MB of memory. Run the same command again to update; `bash ~/Library/Application\ Support/13ft/install.sh --uninstall` removes it and keeps your library.
