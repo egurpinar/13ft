@@ -1,3 +1,4 @@
+import ipaddress
 import json
 import os
 import flask
@@ -6,21 +7,33 @@ import requests
 import uuid
 import threading
 import time
+import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
+from datetime import datetime, timezone
 from functools import lru_cache
-from urllib.parse import urljoin, urlparse, quote, unquote
+from urllib.parse import urljoin, urlparse, urlsplit, quote, unquote
 from flask import request, Response
 from bs4 import BeautifulSoup
 
+from archivist import extract, headless, netguard, pages
+from archivist import store as archive_store
+from archivist import urls as urltools
+
 app = flask.Flask(__name__)
 
+# Outbound requests go through the network guard (public http(s) targets only,
+# checked on every redirect hop). Tests replace this with a fake.
+http_get = netguard.guarded_get
+
 _DEFAULT_STRINGS = {
-    "heading": "Enter Website Link",
-    "label": "Link of the website you want to remove paywall for:",
-    "submit": "Submit",
+    "heading": "Paste a link to read it",
+    "label": "Paste any article link. It opens as a clean page and is saved to your library.",
+    "submit": "Read",
     "toggle_dark_mode": "Toggle Dark Mode",
     "status_heading": "Fetching Article",
     "error_title": "Something went wrong",
-    "retry_button": "Try Another URL",
+    "retry_button": "Try another link",
     "elapsed_template": "{seconds}s elapsed",
     "connection_lost_error": "Connection to server lost. The page may be taking too long to load.",
     "step_connect": "Connecting to website...",
@@ -29,6 +42,20 @@ _DEFAULT_STRINGS = {
     "step_fallback_freedium": "Trying Freedium (Medium bypass)...",
     "step_fallback_org": "Trying archive.org snapshot...",
     "step_fallback_ph": "Trying archive.today / archive.ph snapshot...",
+    "step_fallback_clean": "Trying a fresh browser request (no cookies)...",
+    "step_fallback_headless": "Rendering in a headless browser with paywall scripts blocked...",
+    "library_link": "Library",
+    "paste_button": "Paste link from clipboard",
+    "recent_heading": "Recently read",
+    "library_all": "All saved articles",
+    "step_queued": "Waiting for the previous article to finish...",
+    "step_archives": "The page had only part of the article: checking web archives...",
+    "blocked_target_error": (
+        "Refusing to fetch this address: it is not an http(s) URL, or it points "
+        "to a private or local network. Set ALLOW_PRIVATE_TARGETS=1 if you "
+        "really want to read pages from your own network."
+    ),
+    "nothing_found_error": "No readable copy of the article could be retrieved.",
     "step_process": "Processing article...",
     "step_cleanup": "Cleaning up & preparing view...",
     "step_done": "Done!",
@@ -83,12 +110,11 @@ googlebot_headers = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.6533.119 Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 }
 
+# Seconds to wait for a connection, then at most this long between bytes.
+REQUEST_TIMEOUT = (5, 20)
+
 jobs = {}
 jobs_lock = threading.Lock()
-
-page_cache = {}
-page_cache_lock = threading.Lock()
-PAGE_CACHE_TTL = 300
 
 
 class UserFacingError(Exception):
@@ -96,499 +122,30 @@ class UserFacingError(Exception):
         super().__init__(user_message)
         self.user_message = user_message
 
-html = """
-<!DOCTYPE html>
-<html lang="{{ lang }}">
-
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="X-UA-Compatible" content="IE=edge">
-    <title>13ft Ladder</title>
-    <link rel="icon" href="/favicon.ico" type="image/png">
-    <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600&display=swap" rel="stylesheet" async>
-    <style>
-        * { box-sizing: border-box; }
-        body {
-            font-family: 'Open Sans', sans-serif;
-            background-color: #FFF;
-            margin: 0;
-            padding: 0;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 90vh;
-            transition: background-color 0.3s, color 0.3s;
-        }
-
-        h1 {
-            font-size: 1.5rem;
-            margin-bottom: 20px;
-            text-align: center;
-            color: #333;
-        }
-
-        label {
-            display: block;
-            margin-bottom: 10px;
-            font-weight: bold;
-        }
-
-        input[type=text] {
-            padding: 10px;
-            margin-bottom: 10px;
-            border: 1px solid #ccc;
-            border-radius: 5px;
-            width: 100%;
-            font-size: 1rem;
-        }
-
-        input[type="submit"] {
-            padding: 16px;
-            background-color: #a327f0;
-            color: #fff;
-            border: none;
-            border-radius: 5px;
-            width: 100%;
-            text-transform: uppercase;
-            font-size: 1rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: background-color 0.3s ease;
-        }
-
-        input[type="submit"]:hover {
-            background-color: #821fc0;
-        }
-
-        .dark-mode-toggle {
-            position: absolute;
-            top: 10px;
-            right: 10px;
-        }
-
-        .dark-mode-toggle input {
-            position: absolute;
-            width: 1px;
-            height: 1px;
-            padding: 0;
-            margin: -1px;
-            overflow: hidden;
-            clip: rect(0, 0, 0, 0);
-            white-space: nowrap;
-            border: 0;
-        }
-
-        .dark-mode-toggle label {
-            cursor: pointer;
-            width: 54px;
-            height: 28px;
-            background: #cbd5e1;
-            display: block;
-            border-radius: 100px;
-            position: relative;
-            transition: background-color 0.3s, border-color 0.3s;
-            border: 1px solid #b8c2cc;
-        }
-
-        .dark-mode-toggle label:hover {
-            background: #b8c2cc;
-            border-color: #a1b0be;
-        }
-
-        .dark-mode-toggle input:focus-visible + label {
-            outline: 2px solid #a327f0;
-            outline-offset: 3px;
-        }
-
-        body.dark-mode .dark-mode-toggle input:focus-visible + label {
-            outline-color: #7359f8;
-        }
-
-        .dark-mode-toggle .thumb {
-            position: absolute;
-            top: 2px;
-            left: 2px;
-            width: 22px;
-            height: 22px;
-            background: #fff;
-            border-radius: 50%;
-            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), background-color 0.3s, box-shadow 0.3s;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
-        }
-
-        .dark-mode-toggle input:checked+label {
-            background: #312e81;
-            border-color: #4338ca;
-        }
-
-        .dark-mode-toggle input:checked+label:hover {
-            background: #2e2a78;
-            border-color: #3b379d;
-        }
-
-        .dark-mode-toggle input:checked+label .thumb {
-            transform: translateX(26px);
-            background: #1e1b4b;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 0 8px rgba(99, 102, 241, 0.4);
-        }
-
-        .dark-mode-toggle .icon {
-            position: absolute;
-            width: 14px;
-            height: 14px;
-            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s ease;
-        }
-
-        .dark-mode-toggle .icon.sun {
-            color: #ea580c;
-            opacity: 1;
-            transform: scale(1) rotate(0deg);
-        }
-
-        .dark-mode-toggle .icon.moon {
-            color: #4f46e5;
-            opacity: 0;
-            transform: scale(0) rotate(-90deg);
-        }
-
-        .dark-mode-toggle input:checked+label .icon.sun {
-            opacity: 0;
-            transform: scale(0) rotate(90deg);
-        }
-
-        .dark-mode-toggle input:checked+label .icon.moon {
-            color: #c7d2fe;
-            opacity: 1;
-            transform: scale(1) rotate(0deg);
-        }
-
-        @media only screen and (max-width: 600px) {
-            form, .status-container { padding: 10px; }
-            h1 { font-size: 1.2rem; }
-        }
-
-        body.dark-mode { background-color: #191a21; color: #FFF; }
-        body.dark-mode h1 { color: #FFF; }
-        body.dark-mode input[type=text] { background-color: #555; border: 1px solid #777; color: #FFF; }
-        body.dark-mode input[type="submit"] { background-color: #7359f8; }
-        body.dark-mode input[type="submit"]:hover { background-color: #5c47c6; }
-        body.dark-mode .status-container { background: #23243a; }
-        body.dark-mode .step { color: #aaa; }
-        body.dark-mode .step.active { color: #fff; }
-        body.dark-mode .step.done { color: #7359f8; }
-        body.dark-mode .error-box { background: #3a1c1c; border-color: #ff6b6b; color: #ffaaaa; }
-
-        /* Status page styles */
-        .status-container {
-            max-width: 480px;
-            width: 100%;
-            padding: 30px;
-            text-align: center;
-        }
-
-        .status-container h1 { margin-bottom: 30px; }
-
-        .url-display {
-            font-size: 0.85rem;
-            color: #888;
-            margin-bottom: 24px;
-            word-break: break-all;
-        }
-
-        .progress-bar-track {
-            width: 100%;
-            height: 6px;
-            background: #e0e0e0;
-            border-radius: 3px;
-            overflow: hidden;
-            margin-bottom: 28px;
-        }
-
-        body.dark-mode .progress-bar-track { background: #444; }
-
-        .progress-bar-fill {
-            height: 100%;
-            width: 0%;
-            background: linear-gradient(90deg, #a327f0, #7359f8);
-            border-radius: 3px;
-            transition: width 0.5s ease;
-        }
-
-        .steps { text-align: left; margin-bottom: 24px; }
-
-        .step {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            padding: 8px 0;
-            color: #bbb;
-            font-size: 0.95rem;
-            transition: color 0.3s;
-        }
-
-        .step.active { color: #333; font-weight: 600; }
-        .step.done { color: #a327f0; }
-
-        .step-icon {
-            width: 24px;
-            height: 24px;
-            flex-shrink: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
-        .spinner {
-            width: 18px;
-            height: 18px;
-            border: 2px solid #e0e0e0;
-            border-top-color: #a327f0;
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
-        }
-
-        body.dark-mode .spinner { border-color: #444; border-top-color: #7359f8; }
-
-        @keyframes spin { to { transform: rotate(360deg); } }
-
-        .checkmark { color: #a327f0; font-weight: bold; font-size: 1.1rem; }
-
-        .elapsed {
-            font-size: 0.85rem;
-            color: #999;
-            margin-top: 4px;
-        }
-
-        .error-box {
-            background: #fff0f0;
-            border: 1px solid #ffcccc;
-            border-radius: 8px;
-            padding: 16px;
-            margin-top: 16px;
-            color: #cc3333;
-            font-size: 0.9rem;
-            text-align: left;
-        }
-
-        .error-box strong { display: block; margin-bottom: 6px; }
-
-        .retry-btn {
-            display: inline-block;
-            margin-top: 16px;
-            padding: 10px 24px;
-            background: #a327f0;
-            color: #fff;
-            border: none;
-            border-radius: 5px;
-            font-size: 0.95rem;
-            font-weight: 600;
-            cursor: pointer;
-            text-decoration: none;
-        }
-
-        .retry-btn:hover { background: #821fc0; }
-    </style>
-</head>
-
-<body>
-    <div class="dark-mode-toggle">
-        <input type="checkbox" id="dark-mode-toggle">
-        <label for="dark-mode-toggle" title="{{ toggle_dark_mode }}">
-            <span class="thumb">
-                <svg class="icon sun" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                    <circle cx="12" cy="12" r="5"></circle>
-                    <line x1="12" y1="1" x2="12" y2="3"></line>
-                    <line x1="12" y1="21" x2="12" y2="23"></line>
-                    <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
-                    <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
-                    <line x1="1" y1="12" x2="3" y2="12"></line>
-                    <line x1="21" y1="12" x2="23" y2="12"></line>
-                    <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
-                    <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
-                </svg>
-                <svg class="icon moon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
-                </svg>
-            </span>
-        </label>
-    </div>
-
-    <div id="form-view">
-        <form id="url-form">
-            <h1>{{ heading }}</h1>
-            <label for="link">{{ label }}</label>
-            <input type="text" id="link" name="link" required autofocus>
-            <input type="submit" value="{{ submit }}">
-        </form>
-    </div>
-
-    <div id="status-view" style="display:none;">
-        <div class="status-container">
-            <h1>{{ status_heading }}</h1>
-            <div class="url-display" id="status-url"></div>
-            <div class="progress-bar-track">
-                <div class="progress-bar-fill" id="progress-fill"></div>
-            </div>
-            <div class="steps" id="steps-list"></div>
-            <div class="elapsed" id="elapsed-time"></div>
-            <div id="error-area"></div>
-        </div>
-    </div>
-
-    <script>
-        const toggleSwitch = document.getElementById('dark-mode-toggle');
-        const currentTheme = localStorage.getItem('theme') || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-
-        if (currentTheme === "dark") {
-            document.body.classList.add("dark-mode");
-            toggleSwitch.checked = true;
-        }
-
-        toggleSwitch.addEventListener('change', function () {
-            if (this.checked) {
-                document.body.classList.add("dark-mode");
-                localStorage.setItem('theme', 'dark');
-            } else {
-                document.body.classList.remove("dark-mode");
-                localStorage.setItem('theme', 'light');
-            }
-        });
-
-        const UI_STRINGS = {{ ui_strings | tojson }};
-        const STEPS = {{ steps | tojson }};
-
-        function renderSteps(activeIdx) {
-            const container = document.getElementById('steps-list');
-            container.innerHTML = '';
-            STEPS.forEach((step, i) => {
-                const div = document.createElement('div');
-                div.className = 'step' + (i < activeIdx ? ' done' : i === activeIdx ? ' active' : '');
-                const icon = document.createElement('div');
-                icon.className = 'step-icon';
-                if (i < activeIdx) {
-                    icon.innerHTML = '<span class="checkmark">&#10003;</span>';
-                } else if (i === activeIdx) {
-                    icon.innerHTML = '<div class="spinner"></div>';
-                } else {
-                    icon.innerHTML = '<span style="color:#ddd;">&#9675;</span>';
-                }
-                const text = document.createElement('span');
-                text.textContent = step.label;
-                div.appendChild(icon);
-                div.appendChild(text);
-                container.appendChild(div);
-            });
-        }
-
-        function showStatus(url) {
-            document.getElementById('form-view').style.display = 'none';
-            document.getElementById('status-view').style.display = 'flex';
-            document.getElementById('status-url').textContent = url;
-            document.getElementById('error-area').innerHTML = '';
-            renderSteps(0);
-            document.getElementById('progress-fill').style.width = '0%';
-        }
-
-        function showError(message) {
-            const area = document.getElementById('error-area');
-            area.innerHTML = '';
-            const box = document.createElement('div');
-            box.className = 'error-box';
-            const strong = document.createElement('strong');
-            strong.textContent = UI_STRINGS.error_title;
-            box.appendChild(strong);
-            box.appendChild(document.createTextNode(message));
-            area.appendChild(box);
-            const retry = document.createElement('a');
-            retry.href = '/';
-            retry.className = 'retry-btn';
-            retry.textContent = UI_STRINGS.retry_button;
-            area.appendChild(retry);
-        }
-
-        document.getElementById('url-form').addEventListener('submit', function(e) {
-            e.preventDefault();
-            const link = document.getElementById('link').value.trim();
-            if (!link) return;
-            showStatus(link);
-
-            const startTime = Date.now();
-            const elapsedEl = document.getElementById('elapsed-time');
-            const progressEl = document.getElementById('progress-fill');
-
-            const timer = setInterval(() => {
-                const sec = ((Date.now() - startTime) / 1000).toFixed(0);
-                elapsedEl.textContent = UI_STRINGS.elapsed_template.replace('{seconds}', sec);
-            }, 500);
-
-            const evtSource = new EventSource('/status?url=' + encodeURIComponent(link));
-
-            evtSource.addEventListener('step', function(e) {
-                const data = JSON.parse(e.data);
-                const idx = STEPS.findIndex(s => s.id === data.step);
-                if (idx >= 0) {
-                    renderSteps(idx);
-                    const pct = Math.min(((idx + 1) / STEPS.length) * 100, 95);
-                    progressEl.style.width = pct + '%';
-                }
-                if (data.redirect) {
-                    evtSource.close();
-                    clearInterval(timer);
-                    renderSteps(STEPS.length);
-                    progressEl.style.width = '100%';
-                    setTimeout(() => {
-                        window.location.href = data.redirect;
-                    }, 400);
-                }
-            });
-
-            evtSource.addEventListener('error_msg', function(e) {
-                evtSource.close();
-                clearInterval(timer);
-                const data = JSON.parse(e.data);
-                showError(data.message);
-            });
-
-            evtSource.onerror = function() {
-                evtSource.close();
-                clearInterval(timer);
-                showError(UI_STRINGS.connection_lost_error);
-            };
-        });
-
-        window.addEventListener('pageshow', function(event) {
-            if (event.persisted) {
-                document.getElementById('form-view').style.display = '';
-                document.getElementById('status-view').style.display = 'none';
-                document.getElementById('link').value = '';
-            }
-        });
-    </script>
-</body>
-
-</html>
-"""
+# The home page. Kept under the upstream name; the template lives in archivist/pages.py.
+html = pages.HOME_TEMPLATE
 
 
 def build_steps(strings):
+    # One step per round of sources (see SOURCES), so the progress bar only
+    # moves forward. A round runs only if the previous ones did not return a
+    # complete article.
     return [
+        {"id": "queued", "label": strings["step_queued"]},
         {"id": "connect", "label": strings["step_connect"]},
         {"id": "fetch", "label": strings["step_fetch"]},
-        {"id": "detect", "label": strings["step_detect"]},
-        {"id": "fallback_freedium", "label": strings["step_fallback_freedium"]},
-        {"id": "fallback_org", "label": strings["step_fallback_org"]},
-        {"id": "fallback_ph", "label": strings["step_fallback_ph"]},
+        {"id": "archives", "label": strings["step_archives"]},
+        {"id": "fallback_headless", "label": strings["step_fallback_headless"]},
         {"id": "process", "label": strings["step_process"]},
         {"id": "cleanup", "label": strings["step_cleanup"]},
         {"id": "done", "label": strings["step_done"]},
     ]
 
 
-def render_main_page():
+RECENT_ON_HOME = 8
+
+
+def render_main_page(autostart=None):
     strings = load_strings()
     ui_strings = {
         "error_title": strings["error_title"],
@@ -596,10 +153,17 @@ def render_main_page():
         "elapsed_template": strings["elapsed_template"],
         "connection_lost_error": strings["connection_lost_error"],
     }
+    try:
+        recent, _total = archive_store.get_store().search("", RECENT_ON_HOME)
+    except Exception:  # the home page must work even if the archive cannot be opened
+        app.logger.exception("Could not read the archive")
+        recent = []
     return flask.render_template_string(
         html,
         steps=build_steps(strings),
         ui_strings=ui_strings,
+        autostart=autostart,
+        recent=recent,
         **strings,
     )
 
@@ -761,10 +325,10 @@ def fetch_via_freedium(url, job_id=None):
     for mirror in FREEDIUM_MIRRORS:
         try:
             freedium_url = f"https://{mirror}/{clean_url}"
-            resp = requests.get(
+            resp = http_get(
                 freedium_url,
                 headers=REAL_BROWSER_HEADERS,
-                timeout=30,
+                timeout=REQUEST_TIMEOUT,
                 allow_redirects=True,
             )
             if resp.status_code != 200:
@@ -785,7 +349,7 @@ def fetch_via_archive_org(url, job_id=None):
     set_step(job_id, 'fallback_org')
     wayback_api = "https://archive.org/wayback/available"
     try:
-        meta = requests.get(wayback_api, params={"url": url}, timeout=15).json()
+        meta = http_get(wayback_api, params={"url": url}, timeout=REQUEST_TIMEOUT).json()
         snapshot = meta.get("archived_snapshots", {}).get("closest", {})
         if not snapshot.get("available"):
             return None, None
@@ -798,7 +362,7 @@ def fetch_via_archive_org(url, job_id=None):
                 archived_url.split("/web/")[1].split("/")[0] + "id_",
                 1,
             )
-        resp = requests.get(archived_url, headers=googlebot_headers, timeout=30)
+        resp = http_get(archived_url, headers=googlebot_headers, timeout=REQUEST_TIMEOUT)
         resp.encoding = resp.apparent_encoding
         return resp.text, resp.url
     except Exception:
@@ -811,10 +375,10 @@ def fetch_via_archive_ph(url, job_id=None):
     for mirror in ARCHIVE_PH_MIRRORS:
         try:
             newest_url = f"https://{mirror}/newest/{quote(url, safe=':/')}"
-            resp = requests.get(
+            resp = http_get(
                 newest_url,
                 headers=REAL_BROWSER_HEADERS,
-                timeout=20,
+                timeout=REQUEST_TIMEOUT,
                 allow_redirects=True,
             )
             if resp.status_code != 200:
@@ -840,115 +404,390 @@ def fetch_via_archive_ph(url, job_id=None):
     return None, None
 
 
-def bypass_paywall(url, strings, job_id=None):
-    set_step(job_id, 'connect')
+# --------------------------------------------------------------------------
+# Additional sources
+# --------------------------------------------------------------------------
 
-    if not url.startswith("http"):
-        url = "https://" + url
+class SourceMiss(Exception):
+    """A source answered, but not with anything usable (e.g. HTTP 403)."""
 
-    medium = is_medium_url(url)
-    html_text = ""
-    final_url = url
 
-    if medium:
-        freedium_html, freedium_final = fetch_via_freedium(url, job_id)
-        if freedium_html:
-            set_step(job_id, 'process')
-            result = process_html_document(freedium_html, freedium_final)
-            set_step(job_id, 'cleanup')
-            return result
-    else:
-        set_step(job_id, 'fetch')
-        response = requests.get(url, headers=googlebot_headers, timeout=30)
+ERROR_STATUSES = (401, 402, 403, 404, 407, 410, 429, 451)
+
+
+def decode_html(response):
+    """Use the charset the server declared; otherwise detect it from the bytes."""
+    content_type = (response.headers.get("content-type") or "").lower()
+    if "charset=" not in content_type:
         response.encoding = response.apparent_encoding
-        html_text = response.text
-        final_url = response.url
+    return response.text
 
-        # Treat error status codes as a challenge so the archive fallbacks trigger.
-        # Sites like News24 return 403 with their homepage HTML (which contains a
-        # JS redirect back to the homepage), causing the browser to redirect away.
-        if response.status_code in (401, 403, 407, 429) or response.status_code >= 500:
-            html_text = ""
 
-    set_step(job_id, 'detect')
-    if not html_text or is_challenge_page(html_text):
-        recovered = False
+def _direct_fetch(url, headers):
+    response = http_get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    if response.status_code in ERROR_STATUSES or response.status_code >= 500:
+        raise SourceMiss(f"HTTP {response.status_code}")
+    return decode_html(response), response.url
 
-        archived_html, archived_url = fetch_via_archive_org(url, job_id)
-        if archived_html and not is_challenge_page(archived_html):
-            html_text = archived_html
-            final_url = archived_url
-            recovered = True
 
-        if not recovered:
-            archived_html, archived_url = fetch_via_archive_ph(url, job_id)
-            if archived_html and not is_challenge_page(archived_html):
-                html_text = archived_html
-                final_url = archived_url
-                recovered = True
+def fetch_via_googlebot(url, job_id=None):
+    """13ft's original method: ask for the page the way Google's crawler would."""
+    set_step(job_id, 'fetch')
+    return _direct_fetch(url, googlebot_headers)
 
-        if not recovered:
-            if medium:
-                msg = strings["medium_challenge_error"]
-            else:
-                msg = strings["challenge_error"]
-            raise UserFacingError(msg)
+
+def fetch_via_clean(url, job_id=None):
+    """An ordinary browser request with no cookies, arriving from a search.
+
+    Metered paywalls count free articles in cookies; a request without any
+    starts the count from zero. Some sites also open articles to visitors
+    who arrive from a search engine.
+    """
+    set_step(job_id, 'fallback_clean')
+    headers = dict(REAL_BROWSER_HEADERS)
+    headers["Referer"] = "https://www.google.com/"
+    return _direct_fetch(url, headers)
+
+
+def fetch_via_headless(url, job_id=None):
+    set_step(job_id, 'fallback_headless')
+    return headless.fetch_rendered(url)
+
+
+# name -> (function name in this module, label shown to the user, text for a miss, round)
+#
+# Sources run in rounds. The sources of a round run at the same time and the
+# first complete article ends the search; the next round starts only when no
+# source in this one returned the full text. Round 1 asks the publisher, round
+# 2 the web archives, round 3 (optional) a headless browser.
+SOURCES = {
+    "freedium": ("fetch_via_freedium", "Freedium (Medium)", "no copy available", 1),
+    "googlebot": ("fetch_via_googlebot", "Googlebot request", "no usable response", 1),
+    "clean": ("fetch_via_clean", "Fresh browser request", "no usable response", 1),
+    "wayback": ("fetch_via_archive_org", "Wayback Machine", "no usable snapshot", 2),
+    "archive_today": ("fetch_via_archive_ph", "archive.today", "no usable snapshot, or blocked by a CAPTCHA", 2),
+    "headless": ("fetch_via_headless", "Headless browser", "no usable response", 3),
+}
+SOURCE_LABELS = {name: spec[1] for name, spec in SOURCES.items()}
+ROUND_STEPS = {1: "fetch", 2: "archives", 3: "fallback_headless"}
+# Longest wait for one round; whatever has arrived by then is used.
+ROUND_DEADLINE = 25
+DEFAULT_SOURCES = "googlebot,clean,wayback,archive_today,headless"
+OUTCOME_TEXT = {
+    "complete": "full article",
+    "partial": "incomplete article",
+    "challenge": "bot-protection or CAPTCHA page",
+    "no_article": "no article text found",
+    "empty": "nothing usable",
+    "error": "request failed",
+    "blocked": "refused by the network guard",
+    "skipped": "not needed",
+    "timeout": "no answer in time",
+}
+
+
+def configured_sources(url):
+    """Sources to use for *url* (``SOURCES`` env var, comma-separated), in order of preference."""
+    names = [n.strip().lower() for n in os.environ.get("SOURCES", DEFAULT_SOURCES).split(",")]
+    names = [n for n in dict.fromkeys(names) if n in SOURCES]
+    if is_medium_url(url):
+        if "freedium" not in names:
+            names.insert(0, "freedium")
+    else:
+        names = [n for n in names if n != "freedium"]
+    if "headless" in names and not headless.enabled():
+        names.remove("headless")
+    return names
+
+
+def min_words():
+    try:
+        return max(1, int(os.environ.get("MIN_WORDS", extract.DEFAULT_MIN_WORDS)))
+    except ValueError:
+        return extract.DEFAULT_MIN_WORDS
+
+
+def _attempt(name, outcome, detail=""):
+    return {
+        "source": name,
+        "label": SOURCE_LABELS.get(name, name),
+        "outcome": outcome,
+        "outcome_text": OUTCOME_TEXT.get(outcome, outcome),
+        "detail": detail,
+    }
+
+
+def _describe_request_error(error):
+    if isinstance(error, requests.exceptions.Timeout):
+        return "timed out"
+    if isinstance(error, requests.exceptions.ConnectionError):
+        return "could not connect"
+    if isinstance(error, requests.exceptions.TooManyRedirects):
+        return "too many redirects"
+    return type(error).__name__
+
+
+def summarize_attempts(attempts):
+    parts = []
+    for a in attempts:
+        text = f"{a['label']}: {a['outcome_text']}"
+        if a["detail"]:
+            text += f" ({a['detail']})"
+        parts.append(text)
+    return "Tried " + "; ".join(parts) + "." if parts else ""
+
+
+def _int_env(name, default, minimum=0):
+    try:
+        return max(minimum, int(os.environ.get(name, "") or default))
+    except ValueError:
+        return default
+
+
+# How many articles may be fetched at the same time; more requests wait their
+# turn ("queued") instead of competing for the network and CPU.
+FETCH_SLOTS = threading.BoundedSemaphore(_int_env("FETCH_CONCURRENCY", 2, minimum=1))
+
+
+def resolve_target(raw_url, strings):
+    """User input -> fetchable URL without tracking parameters, or UserFacingError."""
+    target = urltools.parse_target(raw_url)
+    if not target:
+        raise UserFacingError(strings["invalid_url"])
+    target = urltools.strip_tracking(target)
+    try:
+        netguard.check_url(target)
+    except netguard.BlockedTarget:
+        raise UserFacingError(strings["blocked_target_error"]) from None
+    return target
+
+
+def fetch_article(url, strings, job_id=None, refresh=False):
+    """Fetch, extract and archive the article at *url*; return the snapshot id.
+
+    Sources run in rounds (see SOURCES); the first complete-looking article
+    wins. Otherwise the best partial copy is kept, with the reasons it looks
+    incomplete shown on the reader page. An article already in the archive is
+    returned as is unless *refresh* is set.
+    """
+    target = resolve_target(url, strings)
+    key = urltools.archive_key(target)
+    store = archive_store.get_store()
+    if not refresh:
+        existing = store.latest_for(key)
+        if existing:
+            return existing["id"]
+
+    if not FETCH_SLOTS.acquire(blocking=False):
+        set_step(job_id, 'queued')  # only shown when another fetch really is running
+        FETCH_SLOTS.acquire()
+    try:
+        set_step(job_id, 'connect')
+        return _fetch_and_save(target, key, strings, job_id, store)
+    finally:
+        FETCH_SLOTS.release()
+
+
+def _fetch_source(name, target):
+    """Run one source; return (html, source_url). Called in a worker thread."""
+    return globals()[SOURCES[name][0]](target, None)  # no job id: the round sets the progress step
+
+
+def _evaluate(name, future, target, threshold):
+    """Turn one finished source into (attempt, candidate or None)."""
+    miss_text = SOURCES[name][2]
+    try:
+        html_text, source_url = future.result()
+    except SourceMiss as miss:
+        return _attempt(name, "empty", str(miss)), None
+    except netguard.BlockedTarget as blocked:
+        return _attempt(name, "blocked", blocked.reason), None
+    except requests.exceptions.RequestException as error:
+        return _attempt(name, "error", _describe_request_error(error)), None
+    except Exception as error:  # e.g. headless browser crashed: the other sources still count
+        app.logger.warning("Source %s failed for %s: %r", name, target, error)
+        return _attempt(name, "error", type(error).__name__), None
+    if not html_text:
+        return _attempt(name, "empty", miss_text), None
+    if is_challenge_page(html_text):
+        return _attempt(name, "challenge"), None
+    article = extract.extract_article(html_text, target, threshold)
+    if article is None:
+        return _attempt(name, "no_article"), None
+    outcome = "complete" if article.complete else "partial"
+    return _attempt(name, outcome, f"{article.word_count} words"), (name, article, html_text, source_url)
+
+
+def _run_round(names, target, threshold):
+    """Run *names* at the same time; stop at the first complete article.
+
+    Pages are downloaded in parallel and examined one by one as they arrive.
+    Returns (attempts in preference order, best candidate or None).
+    """
+    results = {}
+    best = None
+    complete = False
+    executor = ThreadPoolExecutor(max_workers=len(names), thread_name_prefix="source")
+    futures = {executor.submit(_fetch_source, name, target): name for name in names}
+    try:
+        for future in as_completed(futures, timeout=ROUND_DEADLINE):
+            name = futures[future]
+            attempt, candidate = _evaluate(name, future, target, threshold)
+            results[name] = attempt
+            if candidate and (best is None or candidate[1].score > best[1].score):
+                best = candidate
+            if candidate and candidate[1].complete:
+                complete = True
+                break
+    except FuturesTimeout:
+        pass
+    finally:
+        # Don't wait for slower sources once the answer is known; their
+        # requests end on their own timeouts in the background.
+        executor.shutdown(wait=False, cancel_futures=True)
+    attempts = []
+    for name in names:
+        if name in results:
+            attempts.append(results[name])
+        elif complete:
+            attempts.append(_attempt(name, "skipped", "a faster source had the full article"))
+        else:
+            attempts.append(_attempt(name, "timeout", f"no answer within {ROUND_DEADLINE} s"))
+    return attempts, best
+
+
+def _fetch_and_save(target, key, strings, job_id, store):
+    threshold = min_words()
+    names = configured_sources(target)
+    attempts = []
+    best = None
+    for round_number in sorted({SOURCES[name][3] for name in names}):
+        set_step(job_id, ROUND_STEPS[round_number])
+        round_names = [name for name in names if SOURCES[name][3] == round_number]
+        round_attempts, candidate = _run_round(round_names, target, threshold)
+        attempts.extend(round_attempts)
+        if candidate and (best is None or candidate[1].score > best[1].score):
+            best = candidate
+        if best and best[1].complete:
+            break
+
+    if best is None:
+        raise UserFacingError(f"{strings['nothing_found_error']} {summarize_attempts(attempts)}".strip())
 
     set_step(job_id, 'process')
-    result = process_html_document(html_text, final_url)
-
+    name, article, html_text, source_url = best
+    keep_raw = os.environ.get("STORE_RAW_HTML", "1").strip().lower() not in ("0", "false", "no", "off")
     set_step(job_id, 'cleanup')
-    return result
+    return store.save(
+        url=target,
+        url_key=key,
+        source_url=source_url or target,
+        method=name,
+        title=article.title,
+        byline=article.byline,
+        published=article.published,
+        site_name=article.site_name,
+        content_source=article.content_source,
+        content_html=article.content_html,
+        content_text=article.content_text,
+        word_count=article.word_count,
+        complete=article.complete,
+        warnings=article.warnings,
+        attempts=attempts,
+        raw_html=html_text if keep_raw else None,
+    )
 
 
-def normalize_cache_url(url):
-    if "://" in url:
-        return "https://" + url.split("://", 1)[1]
-    return "https://" + url
-
-
-def clean_page_cache():
-    now = time.time()
-    expired = [k for k, v in page_cache.items() if now - v['timestamp'] > PAGE_CACHE_TTL]
-    for k in expired:
-        del page_cache[k]
-
-
-def fetch_worker(job_id, url, strings):
+def fetch_worker(job_id, url, strings, refresh=False):
     try:
-        result = bypass_paywall(url, strings, job_id)
-        # Never cache challenge/error pages — only store clean article HTML.
-        if not is_challenge_page(result):
-            cache_key = normalize_cache_url(url)
-            with page_cache_lock:
-                clean_page_cache()
-                page_cache[cache_key] = {'html': result, 'timestamp': time.time()}
-        else:
-            cache_key = normalize_cache_url(url)
+        snapshot_id = fetch_article(url, strings, job_id, refresh=refresh)
         with jobs_lock:
-            jobs[job_id]['result'] = cache_key
+            jobs[job_id]['result'] = f"/read/{snapshot_id}"
             jobs[job_id]['step'] = 'done'
-    except requests.exceptions.Timeout:
-        with jobs_lock:
-            jobs[job_id]['error'] = strings["timeout_error"]
-            jobs[job_id]['step'] = 'error'
-    except requests.exceptions.ConnectionError:
-        with jobs_lock:
-            jobs[job_id]['error'] = strings["connection_error"]
-            jobs[job_id]['step'] = 'error'
-    except requests.exceptions.RequestException as e:
-        with jobs_lock:
-            jobs[job_id]['error'] = strings["request_error"]
-            jobs[job_id]['step'] = 'error'
     except UserFacingError as error:
         with jobs_lock:
             jobs[job_id]['error'] = error.user_message
             jobs[job_id]['step'] = 'error'
-    except Exception as e:
+    except Exception:
+        app.logger.exception("Unexpected error while fetching %s", url)
         with jobs_lock:
             jobs[job_id]['error'] = strings["unexpected_error"]
             jobs[job_id]['step'] = 'error'
 
+
+# --------------------------------------------------------------------------
+# Request hygiene for a server that runs on your own machine
+# --------------------------------------------------------------------------
+
+def _allowed_hosts():
+    return {h.strip().lower() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()}
+
+
+@app.before_request
+def check_host_header():
+    """Answer only to localhost, IP addresses and names listed in ALLOWED_HOSTS.
+
+    Without this, a malicious web page could use DNS rebinding to point its
+    own domain at 127.0.0.1 and read your library from its own origin.
+    """
+    hostname = (urlsplit("//" + (request.host or "")).hostname or "").lower()
+    allowed = _allowed_hosts()
+    if "*" in allowed or hostname in allowed or hostname == "localhost":
+        return None
+    try:
+        ipaddress.ip_address(hostname)
+        return None
+    except ValueError:
+        pass
+    return Response(
+        f"Host name '{hostname}' is not allowed. Add it to the ALLOWED_HOSTS "
+        "environment variable (comma-separated), e.g. ALLOWED_HOSTS=reader.local",
+        status=403,
+        mimetype="text/plain",
+    )
+
+
+def is_cross_site_request():
+    """True for form posts that another website made your browser send."""
+    site = request.headers.get("Sec-Fetch-Site")
+    if site is not None:
+        return site not in ("same-origin", "none")
+    origin = request.headers.get("Origin")
+    if origin:
+        return urlsplit(origin).netloc.lower() != (request.host or "").lower()
+    return False  # non-browser clients (curl, scripts)
+
+
+@app.template_filter("ago")
+def format_age(value):
+    """'5 min ago', '3 h ago', '2 d ago', then the date."""
+    try:
+        then = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return value or ""
+    seconds = (datetime.now(timezone.utc) - then).total_seconds()
+    if seconds < 90:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} h ago"
+    if seconds < 7 * 86400:
+        return f"{int(seconds // 86400)} d ago"
+    return then.strftime("%Y-%m-%d")
+
+
+@app.template_filter("when")
+def format_timestamp(value):
+    try:
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M UTC")
+    except (TypeError, ValueError):
+        return value or ""
+
+
+# --------------------------------------------------------------------------
+# Routes
+# --------------------------------------------------------------------------
 
 @app.route("/favicon.ico")
 def favicon():
@@ -961,15 +800,46 @@ def favicon():
     return "", 404
 
 
+MANIFEST = {
+    "name": "13ft Reader",
+    "short_name": "13ft",
+    "description": "Paste a link, read the article, keep a copy.",
+    "start_url": "/",
+    "scope": "/",
+    "display": "standalone",
+    "background_color": "#282c3a",
+    "theme_color": "#282c3a",
+    "icons": [
+        {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png"},
+        {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png"},
+        {"src": "/static/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+    ],
+}
+
+
+@app.route("/manifest.webmanifest")
+def web_manifest():
+    """Lets phones add 13ft to the home screen with its own icon."""
+    return Response(json.dumps(MANIFEST), mimetype="application/manifest+json")
+
+
+@app.route("/robots.txt")
+def robots():
+    return Response("User-agent: *\nDisallow: /\n", mimetype="text/plain")
+
+
 @app.route("/")
 def main_page():
-    return render_main_page()
+    url = request.args.get("url", "").strip()
+    autostart = {"url": url, "refresh": request.args.get("refresh") == "1"} if url else None
+    return render_main_page(autostart)
 
 
 @app.route("/status")
 def status_stream():
     raw_url = request.args.get("url", "")
     url = unquote(raw_url)
+    refresh = request.args.get("refresh") == "1"
 
     if not url:
         return "Missing URL", 400
@@ -977,9 +847,9 @@ def status_stream():
     strings = load_strings()
     job_id = str(uuid.uuid4())
     with jobs_lock:
-        jobs[job_id] = {'step': 'queued', 'result': None, 'error': None}
+        jobs[job_id] = {'step': 'starting', 'result': None, 'error': None}
 
-    thread = threading.Thread(target=fetch_worker, args=(job_id, url, strings))
+    thread = threading.Thread(target=fetch_worker, args=(job_id, url, strings, refresh))
     thread.daemon = True
     thread.start()
 
@@ -996,7 +866,7 @@ def status_stream():
                 if current != last_step:
                     last_step = current
                     if current == 'done':
-                        yield f"event: step\ndata: {json.dumps({'step': 'done', 'redirect': '/' + job['result']})}\n\n"
+                        yield f"event: step\ndata: {json.dumps({'step': 'done', 'redirect': job['result']})}\n\n"
                         break
                     elif current == 'error':
                         yield f"event: error_msg\ndata: {json.dumps({'message': job['error']})}\n\n"
@@ -1015,51 +885,136 @@ def status_stream():
 
 @app.route("/article", methods=["POST"])
 def show_article():
+    """Form fallback for browsers without JavaScript: fetch, then redirect."""
     link = flask.request.form["link"]
     strings = load_strings()
     try:
-        return bypass_paywall(link, strings)
-    except requests.exceptions.Timeout:
-        return strings["timeout_error"], 400
-    except requests.exceptions.ConnectionError:
-        return strings["connection_error"], 400
-    except requests.exceptions.RequestException:
-        return strings["request_error"], 400
+        snapshot_id = fetch_article(link, strings)
     except UserFacingError as error:
         return error.user_message, 400
     except Exception:
+        app.logger.exception("Unexpected error while fetching %s", link)
         return strings["unexpected_error"], 500
+    return flask.redirect(f"/read/{snapshot_id}", code=303)
 
 
-@app.route("/", defaults={"path": ""})
+def _snapshot_or_404(snapshot_id):
+    snapshot = archive_store.get_store().get(snapshot_id)
+    if snapshot is None:
+        flask.abort(404)
+    return snapshot
+
+
+@app.route("/read/<int:snapshot_id>")
+def read_snapshot(snapshot_id):
+    snapshot = _snapshot_or_404(snapshot_id)
+    body = flask.render_template_string(
+        pages.READER_TEMPLATE,
+        snap=snapshot,
+        versions=archive_store.get_store().versions(snapshot["url_key"]),
+        method_label=SOURCE_LABELS.get(snapshot["method"], snapshot["method"]),
+        labels=SOURCE_LABELS,
+        reading_minutes=max(1, math.ceil(snapshot["word_count"] / 230)),
+    )
+    return Response(body, mimetype="text/html", headers={
+        "Content-Security-Policy": pages.READER_CSP,
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
+@app.route("/read/<int:snapshot_id>/original")
+def read_snapshot_original(snapshot_id):
+    """The saved page in its original layout, isolated from this server.
+
+    The ``sandbox`` CSP gives the page an opaque origin, so publisher scripts
+    (if enabled with ?js=1) cannot read your library or anything else on this
+    server. Scripts are off by default, which also keeps paywall overlays off.
+    """
+    snapshot = _snapshot_or_404(snapshot_id)
+    raw = archive_store.get_store().raw_html(snapshot_id)
+    if raw is None:
+        flask.abort(404)
+    # Wayback "id_" snapshots are the publisher's own HTML, so relative links
+    # belong to the publisher; other sources are resolved against where they came from.
+    base = snapshot["url"] if snapshot["method"] == "wayback" else (snapshot["source_url"] or snapshot["url"])
+    sandbox = "sandbox allow-popups allow-popups-to-escape-sandbox"
+    if request.args.get("js") == "1":
+        sandbox += " allow-scripts"
+    return Response(process_html_document(raw, base), mimetype="text/html", headers={
+        "Content-Security-Policy": sandbox,
+        "Referrer-Policy": "no-referrer",
+    })
+
+
+LIBRARY_PAGE_SIZE = 50
+
+
+@app.route("/library")
+def library():
+    query = request.args.get("q", "").strip()
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        page = 1
+    items, total = archive_store.get_store().search(query, LIBRARY_PAGE_SIZE, (page - 1) * LIBRARY_PAGE_SIZE)
+    body = flask.render_template_string(
+        pages.LIBRARY_TEMPLATE,
+        items=items,
+        total=total,
+        q=query,
+        page=page,
+        pages=max(1, math.ceil(total / LIBRARY_PAGE_SIZE)),
+        labels=SOURCE_LABELS,
+    )
+    return Response(body, mimetype="text/html", headers={
+        "Content-Security-Policy": pages.LIBRARY_CSP,
+        "Referrer-Policy": "no-referrer",
+    })
+
+
+@app.route("/library/<int:snapshot_id>/delete", methods=["POST"])
+def delete_snapshot(snapshot_id):
+    if is_cross_site_request():
+        return "Cross-site request refused", 403
+    if not archive_store.get_store().delete(snapshot_id):
+        flask.abort(404)
+    return flask.redirect("/library", code=303)
+
+
+def _raw_request_target():
+    """The path and query exactly as the browser sent them."""
+    raw = request.environ.get("RAW_URI") or request.environ.get("REQUEST_URI")
+    if not raw:
+        raw = request.full_path.rstrip("?")
+    return raw[1:] if raw.startswith("/") else raw
+
+
 @app.route("/<path:path>", methods=["GET"])
 def get_article(path):
+    """``http://127.0.0.1:5000/https://example.com/story`` style links.
+
+    An article already in the library opens straight away; otherwise the
+    progress page starts fetching it.
+    """
     strings = load_strings()
-    full_url = request.url
-    parts = full_url.split("/", 4)
-    if len(parts) >= 5:
-        actual_url = "https://" + parts[4].lstrip("/")
-
-        with page_cache_lock:
-            cached = page_cache.get(actual_url)
-        if cached:
-            return cached['html']
-
-        try:
-            return bypass_paywall(actual_url, strings)
-        except requests.exceptions.Timeout:
-            return strings["timeout_error"], 400
-        except requests.exceptions.ConnectionError:
-            return strings["connection_error"], 400
-        except requests.exceptions.RequestException:
-            return strings["request_error"], 400
-        except UserFacingError as error:
-            return error.user_message, 400
-        except Exception:
-            return strings["unexpected_error"], 500
-    else:
+    target = urltools.parse_target(_raw_request_target())
+    if not target:
         return strings["invalid_url"], 400
+    target = urltools.strip_tracking(target)
+    existing = archive_store.get_store().latest_for(urltools.archive_key(target))
+    if existing:
+        return flask.redirect(f"/read/{existing['id']}", code=302)
+    return render_main_page({"url": target, "refresh": False})
+
+
+def main():
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT") or 5000)
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print(f" * Listening on {host}: other devices on your network can reach this server.")
+    app.run(host=host, port=port, debug=False, threaded=True)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=os.getenv("PORT") or 5000, debug=False)
+    main()

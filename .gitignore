@@ -4,3 +4,6 @@ __pycache__
 .vercel
 .env*.local
 .DS_Store
+
+# Personal archive (SQLite) created by the app
+data/
